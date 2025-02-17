@@ -652,6 +652,8 @@ class BatchPrefillHandler {
 
   uint32_t GetPaddedBatchSize() const { return padded_batch_size_; }
 
+  uint32_t GetOriginalBatchSize() const { return orig_batch_size_; }
+
   WarpLayout GetWarpLayout() const { return warp_layout_; }
 
   uint32_t GetTotalNumRows() const { return total_num_rows_; }
@@ -685,6 +687,7 @@ class BatchPrefillHandler {
         kv_tile_indices_vec, merge_indptr_vec, o_indptr_vec, qo_indptr_h, kv_indptr_h, batch_size,
         num_qo_heads, num_kv_heads, head_dim, page_size));
     const uint32_t qo_tile_size = get_num_rows_per_cta(warp_layout_);
+    orig_batch_size_ = batch_size;
 
     if (IsCUDAGraphEnabled()) {
       padded_batch_size_ = std::max(split_max_batch_size, total_num_tiles_q);
@@ -825,6 +828,7 @@ class BatchPrefillHandler {
     block_valid_mask_ = nullptr;
     total_num_rows_ = 0U;
     padded_batch_size_ = 0U;
+    orig_batch_size_ = 0U;
     warp_layout_ = WarpLayout::k4x1x2;
     return cudaSuccess;
   }
@@ -847,6 +851,7 @@ class BatchPrefillHandler {
         block_valid_mask_(nullptr),
         total_num_rows_(0U),
         padded_batch_size_(0U),
+        orig_batch_size_(0U),
         warp_layout_(WarpLayout::k4x1x2),
         forward_started_(false),
         enable_cuda_graph_(enable_cuda_graph),
@@ -871,6 +876,7 @@ class BatchPrefillHandler {
   bool* block_valid_mask_;
   uint32_t total_num_rows_;
   uint32_t padded_batch_size_;
+  uint32_t orig_batch_size_;
   WarpLayout warp_layout_;
   bool forward_started_;
   bool enable_cuda_graph_;

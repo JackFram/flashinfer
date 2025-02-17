@@ -168,6 +168,37 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapper(
   return cudaSuccess;
 }
 
+template <PageStorage PAGE_STORAGE, typename DTypeQ, typename DTypeKV, typename DTypeOut,
+          typename IdType>
+cudaError_t TopKBatchPrefillWithPagedKVCacheWrapper(
+    BatchPrefillHandler* handler, DTypeQ* q, IdType* qo_indptr, IdType* q_offset,
+    paged_kv_t<PAGE_STORAGE, DTypeKV, IdType> paged_kv, DTypeOut* o, float* lse, DTypeOut* qk_product,
+    uint32_t num_qo_heads, bool causal = true,
+    PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
+    bool allow_fp16_qk_reduction = false, std::optional<float> maybe_sm_scale = std::nullopt,
+    float rope_scale = 1.f, float rope_theta = 1e4, cudaStream_t stream = nullptr) {
+  const float sm_scale = maybe_sm_scale.value_or(1.f / std::sqrt(float(paged_kv.head_dim)));
+  const uint32_t num_kv_heads = paged_kv.num_heads;
+  const uint32_t head_dim = paged_kv.head_dim;
+  const MaskMode mask_mode = causal ? MaskMode::kCausal : MaskMode::kNone;
+  DISPATCH_head_dim(
+      head_dim, HEAD_DIM,
+      {DISPATCH_mask_mode(
+          mask_mode, MASK_MODE,
+          {DISPATCH_pos_encoding_mode(
+              pos_encoding_mode, POS_ENCODING_MODE,
+              {DISPATCH_allow_fp16_qk_reduction(allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, {
+                return TopKBatchPrefillWithPagedKVCacheWrapperDispatched<
+                    PAGE_STORAGE, HEAD_DIM, LogitsPostHook::kNone, POS_ENCODING_MODE,
+                    ALLOW_FP16_QK_REDUCTION, MASK_MODE, DTypeQ, DTypeKV, DTypeOut, IdType>(
+                    handler, q, qo_indptr, q_offset, paged_kv,
+                    /*custom_mask=*/nullptr,
+                    /*qk_indptr=*/nullptr, o, lse, qk_product, num_qo_heads, /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, sm_scale, rope_scale, rope_theta, stream);
+              })})})});
+  return cudaSuccess;
+}
+
 template <typename DTypeQ, typename DTypeKV, typename DTypeOut>
 cudaError_t SingleDecodeWithKVCache(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTypeOut* o, DTypeOut* tmp,
                                     uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t seq_len,
@@ -271,6 +302,57 @@ cudaError_t BatchDecodeWithPagedKVCacheWrapper(
                           PAGE_STORAGE, HEAD_DIM, LogitsPostHook::kNone, POS_ENCODING_MODE, DTypeQ,
                           DTypeKV, DTypeOut, IdType>(
                           handler, q, q_offset, paged_kv, o, lse, num_qo_heads,
+                          /*window_left=*/-1,
+                          /*logits_soft_cap=*/0.f, sm_scale, rope_scale, rope_theta, stream);
+                    })});
+  return cudaSuccess;
+}
+
+/*!
+ * \brief Wrapper of TopKBatchDecodeWithPagedKVCache function, and caches the temporary buffer
+ *   for cooperative kernels.
+ * \tparam page_storage Whether to store indices or pointers of each active page
+ * \tparam DTypeQ The data type of query tensor.
+ * \tparam DTypeKV The data type of key-value tensor.
+ * \tparam DTypeOut The data type of output tensor.
+ * \tparam IdType The data type of index tensor.
+ * \param handler The handler for the batch decode forward request.
+ * \param q The input tensor.
+ * \param paged_kv The paged key-value tensor.
+ * \param o The output tensor.
+ * \param lse The logsumexp values.
+ * \param qk_product The qk_product values.
+ * \param num_qo_heads The number of heads.
+ * \param pos_encoding_mode The positional encoding mode.
+ * \param rope_scale The scale of rope.
+ * \param rope_theta The theta of rope.
+ * \param stream The CUDA stream.
+ * \note This wrapper function should be only called after we call BeginForward function in the
+ *   BatchDecodeHandler.
+ */
+template <PageStorage PAGE_STORAGE, typename DTypeQ, typename DTypeKV, typename DTypeOut,
+          typename IdType>
+cudaError_t TopKBatchDecodeWithPagedKVCacheWrapper(
+    BatchDecodeHandler* handler, DTypeQ* q, IdType* q_offset,
+    paged_kv_t<PAGE_STORAGE, DTypeKV, IdType> paged_kv, DTypeOut* o, float* lse, DTypeOut* qk_product,
+    uint32_t num_qo_heads, PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
+    std::optional<float> maybe_sm_scale = std::nullopt, float rope_scale = 1.f,
+    float rope_theta = 1e4, cudaStream_t stream = nullptr) {
+  float sm_scale = maybe_sm_scale.value_or(1.f / std::sqrt(float(paged_kv.head_dim)));
+  const uint32_t num_kv_heads = paged_kv.num_heads;
+  if (num_qo_heads % num_kv_heads != 0) {
+    std::ostringstream err_msg;
+    err_msg << "num_qo_heads " << num_qo_heads << " is not a multiple of num_kv_heads "
+            << num_kv_heads;
+    throw std::invalid_argument(err_msg.str());
+  }
+
+  DISPATCH_head_dim(paged_kv.head_dim, HEAD_DIM,
+                    {DISPATCH_pos_encoding_mode(pos_encoding_mode, POS_ENCODING_MODE, {
+                      return TopKBatchDecodeWithPagedKVCacheWrapperDispatched<
+                          PAGE_STORAGE, HEAD_DIM, LogitsPostHook::kNone, POS_ENCODING_MODE, DTypeQ,
+                          DTypeKV, DTypeOut, IdType>(
+                          handler, q, q_offset, paged_kv, o, lse, qk_product, num_qo_heads,
                           /*window_left=*/-1,
                           /*logits_soft_cap=*/0.f, sm_scale, rope_scale, rope_theta, stream);
                     })});

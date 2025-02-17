@@ -24,6 +24,7 @@ from .cascade import (
 )
 from .decode import (
     BatchDecodeWithPagedKVCacheWrapper,
+    TopKBatchDecodeWithPagedKVCacheWrapper,
     CUDAGraphBatchDecodeWithPagedKVCacheWrapper,
     single_decode_with_kv_cache,
 )
@@ -33,6 +34,7 @@ from .norm import fused_add_rmsnorm, rmsnorm
 from .page import append_paged_kv_cache
 from .prefill import (
     BatchPrefillWithPagedKVCacheWrapper,
+    TopKBatchPrefillWithPagedKVCacheWrapper,
     BatchPrefillWithRaggedKVCacheWrapper,
     single_prefill_with_kv_cache,
     single_prefill_with_kv_cache_return_lse,

@@ -271,6 +271,127 @@ void _FlashInferAttentionPrefillWithPagedKVCache(int64_t handler_id, DLTensor* q
           })})});
 }
 
+void _FlashInferTopKAttentionPrefillWithPagedKVCache(int64_t handler_id, DLTensor* q_data,
+                                                 DLTensor* qo_indptr,          //
+                                                 DLTensor* pages,              //
+                                                 DLTensor* page_table_indptr,  //
+                                                 DLTensor* page_table_values,  //
+                                                 DLTensor* last_page_len,      //
+                                                 DLTensor* k_rope_pos_offset,  //
+                                                 DLTensor* q_offset,           //
+                                                 DLTensor* output,             //
+                                                 DLTensor* lse,                //
+                                                 DLTensor* qk_product,         //
+                                                 int64_t causal,               //
+                                                 int64_t pos_encoding_mode,    //
+                                                 double rope_scale,            //
+                                                 double rope_theta,
+                                                 double attn_score_scaling_factor = 1.0f) {
+  CHECK(handler_id < max_num_handlers) << "The handler id must be less than " << max_num_handlers;
+  CHECK_EQ(q_data->device.device_type, kDLCUDA) << "The device of q_data must be CUDA.";
+  CHECK_EQ(pages->device.device_type, kDLCUDA) << "The device of kv pages must be CUDA.";
+  CHECK_EQ(page_table_indptr->device.device_type, kDLCUDA)
+      << "The device of page_table_indptr matrix must be CUDA.";
+  CHECK_EQ(page_table_values->device.device_type, kDLCUDA)
+      << "The device of page_table_values matrix must be CUDA.";
+  CHECK_EQ(last_page_len->device.device_type, kDLCUDA)
+      << "The device of last_page_len matrix must be CUDA.";
+  CHECK_EQ(q_offset->device.device_type, kDLCUDA) << "The device of q_offset matrix must be CUDA.";
+  CHECK_EQ(k_rope_pos_offset->device.device_type, kDLCUDA)
+      << "The device of k_rope_pos_offset matrix must be CUDA.";
+  CHECK_EQ(qo_indptr->device.device_type, kDLCUDA)
+      << "The device of qo_indptr matrix must be CUDA.";
+  CHECK_EQ(output->device.device_type, kDLCUDA) << "The device of output must be CUDA.";
+  
+  int32_t dev_id = q_data->device.device_id;
+  CHECK_EQ(pages->device.device_id, dev_id);
+  CHECK_EQ(page_table_indptr->device.device_id, dev_id);
+  CHECK_EQ(page_table_values->device.device_id, dev_id);
+  CHECK_EQ(last_page_len->device.device_id, dev_id);
+  CHECK_EQ(q_offset->device.device_id, dev_id);
+  CHECK_EQ(k_rope_pos_offset->device.device_id, dev_id);
+  CHECK_EQ(qo_indptr->device.device_id, dev_id);
+  CHECK_EQ(output->device.device_id, dev_id);
+
+  CHECK(q_data->dtype.lanes == 1 && pages->dtype.lanes == 1 && output->dtype.lanes == 1);
+  CHECK(q_data->dtype.bits == pages->dtype.bits && q_data->dtype.code == pages->dtype.code);
+  CHECK(page_table_indptr->dtype.lanes == 1 && page_table_values->dtype.lanes == 1 &&
+        last_page_len->dtype.lanes == 1 && q_offset->dtype.lanes == 1 &&
+        k_rope_pos_offset->dtype.lanes == 1 && qo_indptr->dtype.lanes == 1);
+  CHECK(page_table_indptr->dtype.bits == page_table_values->dtype.bits &&
+        page_table_indptr->dtype.bits == last_page_len->dtype.bits &&
+        page_table_indptr->dtype.bits == qo_indptr->dtype.bits &&
+        page_table_indptr->dtype.code == page_table_values->dtype.code &&
+        page_table_indptr->dtype.code == last_page_len->dtype.code &&
+        page_table_indptr->dtype.code == q_offset->dtype.code &&
+        page_table_indptr->dtype.code == k_rope_pos_offset->dtype.code &&
+        page_table_indptr->dtype.code == qo_indptr->dtype.code);
+
+  CHECK_EQ(pages->ndim, 5);
+  CHECK_EQ(pages->shape[1], 2);
+  int64_t nhead_kv = pages->shape[2];
+  int64_t nhead_qo = q_data->shape[1];
+  int64_t nfeat = pages->shape[4];
+  int64_t page_size = pages->shape[3];
+  CHECK_EQ(page_size, 1); // for TidalInference, we need to use a page_size of 1
+
+  CHECK_EQ(last_page_len->ndim, 1);
+  int64_t num_total_seqs = last_page_len->shape[0];
+
+  CHECK_EQ(qo_indptr->ndim, 1);
+  CHECK_EQ(qo_indptr->shape[0], num_total_seqs + 1);
+
+  CHECK_EQ(page_table_indptr->ndim, 1);
+  CHECK_EQ(page_table_indptr->shape[0], num_total_seqs + 1);
+  CHECK_EQ(page_table_values->ndim, 1);
+
+  CHECK_EQ(q_data->ndim, 3);
+  CHECK_EQ(output->ndim, 3);
+  CHECK_EQ(q_data->shape[2], nfeat);
+  CHECK_EQ(output->shape[1], nhead_qo);
+  CHECK_EQ(output->shape[2], nfeat);
+  CHECK_EQ(q_offset->ndim, 1);
+  CHECK_EQ(q_offset->shape[0], q_data->shape[0]);
+
+  CHECK_EQ(k_rope_pos_offset->ndim, 1);
+  CHECK_EQ(k_rope_pos_offset->shape[0], num_total_seqs);
+
+  constexpr PageStorage page_storage = PageStorage::kIndices;
+  constexpr QKVLayout kv_layout = QKVLayout::kHND;
+  const float sm_scale = attn_score_scaling_factor / std::sqrt(static_cast<float>(nfeat));
+
+  DISPATCH_TVM_CUDA_DTYPE(
+      pages->dtype, dtype_in,
+      {DISPATCH_TVM_CUDA_DTYPE(
+          output->dtype, dtype_out, {DISPATCH_TVM_CUDA_IDTYPE(page_table_values->dtype, dtype_idx, {
+            paged_kv_t<page_storage, dtype_in, dtype_idx> cache(
+                nhead_kv, page_size, nfeat, num_total_seqs, kv_layout,
+                static_cast<dtype_in*>(pages->data) + pages->byte_offset / sizeof(dtype_in),
+                static_cast<dtype_idx*>(page_table_values->data) +
+                    page_table_values->byte_offset / sizeof(dtype_idx),
+                static_cast<dtype_idx*>(page_table_indptr->data) +
+                    page_table_indptr->byte_offset / sizeof(dtype_idx),
+                static_cast<dtype_idx*>(last_page_len->data) +
+                    last_page_len->byte_offset / sizeof(dtype_idx),
+                static_cast<dtype_idx*>(k_rope_pos_offset->data) +
+                    k_rope_pos_offset->byte_offset / sizeof(dtype_idx));
+            cudaError_t status = TopKBatchPrefillWithPagedKVCacheWrapper<
+                page_storage, dtype_in, dtype_in, dtype_out, dtype_idx>(
+                &batch_prefill_paged_kv_handlers[handler_id], static_cast<dtype_in*>(q_data->data),
+                static_cast<dtype_idx*>(qo_indptr->data) +
+                    qo_indptr->byte_offset / sizeof(dtype_idx),
+                static_cast<dtype_idx*>(q_offset->data) + q_offset->byte_offset / sizeof(dtype_idx),
+                cache, static_cast<dtype_out*>(output->data),
+                /*lse=*/static_cast<float*>(lse->data), static_cast<dtype_out*>(qk_product->data), nhead_qo,
+                /*causal=*/causal, PosEncodingMode(pos_encoding_mode),
+                /*allow_fp16_qk_reduction=*/false, sm_scale, rope_scale, rope_theta,
+                /*stream=*/0);
+            if (status != cudaSuccess) {
+              LOG(FATAL) << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
+            }
+          })})});
+}
+
 void _FlashInferAttentionPrefillWithPagedKVCacheBeginForward(
     int64_t handler_idx, DLTensor* float_workspace_buffer, DLTensor* int_workspace_buffer,
     DLTensor* qo_indptr, DLTensor* kv_indptr, int64_t batch_size, int64_t num_qo_heads,
@@ -412,6 +533,115 @@ void _FlashInferAttentionDecodeWithPagedKVCache(int64_t handler_id, DLTensor* q_
                 static_cast<dtype_idx*>(q_offset->data) + q_offset->byte_offset / sizeof(dtype_idx),
                 cache, static_cast<dtype_out*>(output->data),
                 /*lse=*/static_cast<float*>(lse->data), nhead_qo,
+                PosEncodingMode(pos_encoding_mode), sm_scale, rope_scale, rope_theta,
+                /*stream=*/0);
+            if (status != cudaSuccess) {
+              LOG(FATAL) << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
+            }
+          })})});
+}
+
+void _FlashInferTopKAttentionDecodeWithPagedKVCache(int64_t handler_id, DLTensor* q_data,
+                                                DLTensor* pages,
+                                                DLTensor* page_table_indptr,    //
+                                                DLTensor* page_table_values,    //
+                                                DLTensor* last_page_len,        //
+                                                DLTensor* k_rope_pos_offset,    //
+                                                DLTensor* q_offset,             //
+                                                DLTensor* output,               //
+                                                DLTensor* lse,                  //
+                                                DLTensor* qk_product,           //
+                                                int64_t pos_encoding_mode = 0,  //
+                                                double rope_scale = 1.0f,       //
+                                                double rope_theta = 1e4,
+                                                double attn_score_scaling_factor = 1.0f) {
+  CHECK_LT(handler_id, max_num_handlers) << "The handler id must be less than " << max_num_handlers;
+  CHECK_EQ(q_data->device.device_type, kDLCUDA) << "The device of q_data must be CUDA.";
+  CHECK_EQ(pages->device.device_type, kDLCUDA) << "The device of kv pages must be CUDA.";
+  CHECK_EQ(page_table_indptr->device.device_type, kDLCUDA)
+      << "The device of page_table_indptr matrix must be CUDA.";
+  CHECK_EQ(page_table_values->device.device_type, kDLCUDA)
+      << "The device of page_table_values matrix must be CUDA.";
+  CHECK_EQ(last_page_len->device.device_type, kDLCUDA)
+      << "The device of last_page_len matrix must be CUDA.";
+  CHECK_EQ(q_offset->device.device_type, kDLCUDA) << "The device of q_offset matrix must be CUDA.";
+  CHECK_EQ(k_rope_pos_offset->device.device_type, kDLCUDA)
+      << "The device of k_rope_pos_offset matrix must be CUDA.";
+  CHECK_EQ(output->device.device_type, kDLCUDA) << "The device of output must be CUDA.";
+
+  int32_t dev_id = q_data->device.device_id;
+  CHECK_EQ(pages->device.device_id, dev_id);
+  CHECK_EQ(page_table_indptr->device.device_id, dev_id);
+  CHECK_EQ(page_table_values->device.device_id, dev_id);
+  CHECK_EQ(last_page_len->device.device_id, dev_id);
+  CHECK_EQ(q_offset->device.device_id, dev_id);
+  CHECK_EQ(k_rope_pos_offset->device.device_id, dev_id);
+  CHECK_EQ(output->device.device_id, dev_id);
+
+  CHECK(q_data->dtype.lanes == 1 && pages->dtype.lanes == 1 && output->dtype.lanes == 1);
+  CHECK(q_data->dtype.bits == pages->dtype.bits && q_data->dtype.code == pages->dtype.code);
+  CHECK(page_table_indptr->dtype.lanes == 1 && page_table_values->dtype.lanes == 1 &&
+        last_page_len->dtype.lanes == 1 && q_offset->dtype.lanes == 1 &&
+        k_rope_pos_offset->dtype.lanes == 1);
+  CHECK(page_table_indptr->dtype.bits == page_table_values->dtype.bits &&
+        page_table_indptr->dtype.bits == last_page_len->dtype.bits &&
+        page_table_indptr->dtype.code == page_table_values->dtype.code &&
+        page_table_indptr->dtype.code == last_page_len->dtype.code &&
+        page_table_indptr->dtype.code == q_offset->dtype.code &&
+        page_table_indptr->dtype.code == k_rope_pos_offset->dtype.code);
+
+  CHECK_EQ(pages->ndim, 5);
+  CHECK_EQ(pages->shape[1], 2);
+  int64_t nhead_kv = pages->shape[2];
+  int64_t nfeat = pages->shape[4];
+  int64_t page_size = pages->shape[3];
+
+  CHECK_EQ(last_page_len->ndim, 1);
+  int64_t num_total_seqs = last_page_len->shape[0];
+
+  CHECK_EQ(page_table_indptr->ndim, 1);
+  CHECK_EQ(page_table_indptr->shape[0], num_total_seqs + 1);
+  CHECK_EQ(page_table_values->ndim, 1);
+
+  CHECK_EQ(q_data->ndim, 3);
+  CHECK_EQ(output->ndim, 3);
+  CHECK_GE(q_data->shape[0], 1);
+  CHECK_EQ(q_data->shape[0], output->shape[0]);
+  CHECK_EQ(q_data->shape[2], nfeat);
+  int64_t nhead_qo = q_data->shape[1];
+  CHECK_EQ(output->shape[1], nhead_qo);
+  CHECK_EQ(output->shape[2], nfeat);
+  CHECK_EQ(q_offset->ndim, 1);
+  CHECK_EQ(q_offset->shape[0], num_total_seqs);
+
+  CHECK_EQ(k_rope_pos_offset->ndim, 1);
+  CHECK_EQ(k_rope_pos_offset->shape[0], num_total_seqs);
+
+  constexpr PageStorage page_storage = PageStorage::kIndices;
+  constexpr QKVLayout kv_layout = QKVLayout::kHND;
+  const float sm_scale = attn_score_scaling_factor / std::sqrt(static_cast<float>(nfeat));
+
+  DISPATCH_TVM_CUDA_DTYPE(
+      pages->dtype, dtype_in,
+      {DISPATCH_TVM_CUDA_DTYPE(
+          output->dtype, dtype_out, {DISPATCH_TVM_CUDA_IDTYPE(page_table_values->dtype, dtype_idx, {
+            paged_kv_t<page_storage, dtype_in, dtype_idx> cache(
+                nhead_kv, page_size, nfeat, num_total_seqs, kv_layout,
+                static_cast<dtype_in*>(pages->data) + pages->byte_offset / sizeof(dtype_in),
+                static_cast<dtype_idx*>(page_table_values->data) +
+                    page_table_values->byte_offset / sizeof(dtype_idx),
+                static_cast<dtype_idx*>(page_table_indptr->data) +
+                    page_table_indptr->byte_offset / sizeof(dtype_idx),
+                static_cast<dtype_idx*>(last_page_len->data) +
+                    last_page_len->byte_offset / sizeof(dtype_idx),
+                static_cast<dtype_idx*>(k_rope_pos_offset->data) +
+                    k_rope_pos_offset->byte_offset / sizeof(dtype_idx));
+            cudaError_t status = TopKBatchDecodeWithPagedKVCacheWrapper<page_storage, dtype_in,
+                                                                    dtype_in, dtype_out, dtype_idx>(
+                &batch_decode_handlers[handler_id], static_cast<dtype_in*>(q_data->data),
+                static_cast<dtype_idx*>(q_offset->data) + q_offset->byte_offset / sizeof(dtype_idx),
+                cache, static_cast<dtype_out*>(output->data), 
+                /*lse=*/static_cast<float*>(lse->data), static_cast<dtype_out*>(qk_product->data), nhead_qo,
                 PosEncodingMode(pos_encoding_mode), sm_scale, rope_scale, rope_theta,
                 /*stream=*/0);
             if (status != cudaSuccess) {
@@ -805,6 +1035,9 @@ void _FlashInferParallelTopPSamplingFromProb(DLTensor* probs, DLTensor* uniform_
 TVM_REGISTER_GLOBAL("flashinfer.attention_kernel_prefill_with_paged_kv_cache")
     .set_body_typed(_FlashInferAttentionPrefillWithPagedKVCache);
 
+TVM_REGISTER_GLOBAL("flashinfer.topk_attention_kernel_prefill_with_paged_kv_cache")
+    .set_body_typed(_FlashInferTopKAttentionPrefillWithPagedKVCache);
+
 TVM_REGISTER_GLOBAL("flashinfer.attention_kernel_prefill_with_paged_kv_cache_begin_forward")
     .set_body_typed(_FlashInferAttentionPrefillWithPagedKVCacheBeginForward);
 
@@ -813,6 +1046,9 @@ TVM_REGISTER_GLOBAL("flashinfer.attention_kernel_prefill_with_paged_kv_cache_end
 
 TVM_REGISTER_GLOBAL("flashinfer.attention_kernel_decode_with_paged_kv_cache")
     .set_body_typed(_FlashInferAttentionDecodeWithPagedKVCache);
+
+TVM_REGISTER_GLOBAL("flashinfer.topk_attention_kernel_decode_with_paged_kv_cache")
+    .set_body_typed(_FlashInferTopKAttentionDecodeWithPagedKVCache);
 
 TVM_REGISTER_GLOBAL("flashinfer.attention_kernel_decode_with_paged_kv_cache_begin_forward")
     .set_body_typed(_FlashInferAttentionDecodeWithPagedKVCacheBeginForward);

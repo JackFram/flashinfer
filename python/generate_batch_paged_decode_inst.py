@@ -49,6 +49,15 @@ template cudaError_t BatchDecodeWithPagedKVCacheDispatched<{head_dim}, page_stor
     int32_t window_left, float logits_soft_cap, float sm_scale, float rope_scale,
     float rope_theta, cudaStream_t stream);
 
+template cudaError_t TopKBatchDecodeWithPagedKVCacheDispatched<{head_dim}, page_storage, {logits_hook}, {pos_encoding_mode}, {dtype_q}, {dtype_kv}, {dtype_out}, {idtype}>(
+    {dtype_q}* q, {idtype}* q_offset,
+    paged_kv_t<page_storage, {dtype_kv}, {idtype}> paged_kv,
+    kv_partition_info_t<{idtype}> kv_partition_info,
+    {dtype_out}* o, {dtype_out}* tmp_v, float* tmp_s, float* lse, {dtype_out}* qk_product,
+    bool* block_valid_mask, uint32_t padded_batch_size, uint32_t num_qo_heads,
+    int32_t window_left, float logits_soft_cap, float sm_scale, float rope_scale,
+    float rope_theta, cudaStream_t stream);
+
 }}
     """.format(
         logits_hook=logits_hook_literal[int(logits_hook)],
