@@ -32,14 +32,15 @@ using IdType = int32_t;
 
 #define DISPATCH_context(DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM_QK, HEAD_DIM_VO,    \
                          POS_ENCODING_MODE, USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP,              \
-                         USE_FP16_QK_REDUCTION, AttentionVariant, RaggedParams, PagedParams, ...) \
+                         USE_FP16_QK_REDUCTION, AttentionVariant, RaggedParams, PagedParams, TopkParams, ...) \
   {                                                                                               \
     DISPATCH_mask_mode(mask_mode, MASK_MODE, [&] {                                                \
       return DISPATCH_PYTORCH_QKV_DTYPE_TO_CTYPE(                                                 \
           q_scalar_type, kv_scalar_type, DTypeQ, DTypeKV, [&] {                                   \
             using DTypeO = DTypeQ;                                                                \
             using RaggedParams = BatchPrefillRaggedParams<DTypeQ, DTypeKV, DTypeO, IdType>;       \
-            using PagedParams = BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeO, IdType>;         \
+            using PagedParams = BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeO, IdType>;
+            using TopKParams = TopKBatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeO, IdType>;      \
             constexpr auto POS_ENCODING_MODE = PosEncodingMode::kNone;                            \
             constexpr bool USE_FP16_QK_REDUCTION = false;                                         \
             constexpr bool use_custom_mask = MASK_MODE == MaskMode::kCustom;                      \

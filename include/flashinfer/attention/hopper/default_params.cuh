@@ -150,6 +150,53 @@ struct BatchPrefillPagedParams {
   bool causal;
 };
 
+template <typename DTypeQ_, typename DTypeKV_, typename DTypeO_, typename IdType_>
+struct TopKBatchPrefillPagedParams {
+  using DTypeQ = DTypeQ_;
+  using DTypeKV = DTypeKV_;
+  using DTypeO = DTypeO_;
+  using IdType = IdType_;
+  // The QKV matrices.
+  DTypeQ* q_ptr;
+  DTypeKV* k_ptr;
+  DTypeKV* v_ptr;
+  DTypeO* o_ptr;
+  DTypeO* qk_ptr;
+  float* lse_ptr;
+
+  IdType* qo_tile_indices;
+  IdType* qo_indptr;
+  IdType* kv_indptr;
+  IdType* kv_indices;
+  IdType* qo_lens;
+  IdType* kv_lens;
+  IdType* head_indices;
+  IdType* work_indptr;
+
+  struct AdditionalParams {
+    float logits_soft_cap;
+    float sm_scale;
+  } additional_params;
+
+  int64_t q_stride_n;
+  int64_t k_stride_n;
+  int64_t v_stride_n;
+  int64_t o_stride_n;
+  int64_t q_stride_h;
+  int64_t k_stride_h;
+  int64_t v_stride_h;
+  int64_t o_stride_h;
+  int64_t nnz_qo;
+
+  int num_qo_heads;
+  int num_kv_heads;
+  int group_size;
+  int page_size;
+  int window_left;
+
+  bool causal;
+};
+
 }  // namespace flashinfer
 
 #endif  // FLASHINFER_ATTENTION_HOPPER_PARAMS_CUH

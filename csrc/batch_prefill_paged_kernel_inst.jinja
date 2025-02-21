@@ -11,4 +11,10 @@ template cudaError_t BatchPrefillWithPagedKVCacheDispatched<
     {{ variant_name }}, PagedParams>(PagedParams params, {{ dtype_o }}* tmp_v, float* tmp_s, cudaStream_t stream);
 {% endfor %}
 
+{% for cta_tile_q in [16, 64, 128] %}
+template cudaError_t TopKBatchPrefillWithPagedKVCacheDispatched<
+    /*CTA_TILE_Q=*/{{cta_tile_q}}, {{head_dim_qk}}, {{head_dim_vo}}, {{pos_encoding_mode}}, {{use_fp16_qk_reduction}}, {{mask_mode}},
+    {{ variant_name }}, TopKParams>(TopKParams params, {{ dtype_o }}* tmp_v, float* tmp_s, cudaStream_t stream);
+{% endfor %}
+
 };  // namespace flashinfer

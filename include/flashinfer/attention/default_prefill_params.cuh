@@ -383,6 +383,124 @@ struct BatchPrefillPagedParams {
   }
 };
 
+template <typename DTypeQ_, typename DTypeKV_, typename DTypeO_, typename IdType_>
+struct TopKBatchPrefillPagedParams {
+  using DTypeQ = DTypeQ_;
+  using DTypeKV = DTypeKV_;
+  using DTypeO = DTypeO_;
+  using IdType = IdType_;
+
+  DTypeQ* q;
+  paged_kv_t<DTypeKV, IdType> paged_kv;
+  uint8_t* maybe_custom_mask;
+  IdType* q_indptr;
+  IdType* maybe_mask_indptr;
+  IdType* maybe_q_rope_offset;  // maybe_q_rope_offset is only used for fused-rope attention
+  DTypeO* o;
+  DTypeO* qk_ptr;
+  float* lse;
+  float* maybe_alibi_slopes;
+  uint_fastdiv group_size;
+  uint32_t num_qo_heads;
+  IdType q_stride_n;
+  IdType q_stride_h;
+  int32_t window_left;
+  float logits_soft_cap;
+  float sm_scale;
+  float rope_rcp_scale;
+  float rope_rcp_theta;
+
+  IdType* request_indices;
+  IdType* qo_tile_indices;
+  IdType* kv_tile_indices;
+  IdType* merge_indptr;
+  IdType* o_indptr;
+  bool* block_valid_mask;
+  IdType* kv_chunk_size_ptr;
+  uint32_t max_total_num_rows;
+  uint32_t* total_num_rows;
+  uint32_t padded_batch_size;
+  bool partition_kv;
+
+  __host__ TopKBatchPrefillPagedParams()
+      : q(nullptr),
+        paged_kv(),
+        maybe_custom_mask(nullptr),
+        q_indptr(nullptr),
+        maybe_mask_indptr(nullptr),
+        maybe_q_rope_offset(nullptr),
+        o(nullptr),
+        qk_ptr(nullptr),
+        lse(nullptr),
+        maybe_alibi_slopes(nullptr),
+        group_size(),
+        num_qo_heads(0),
+        q_stride_n(0),
+        q_stride_h(0),
+        window_left(0),
+        logits_soft_cap(0.0f),
+        sm_scale(0.0f),
+        rope_rcp_scale(0.0f),
+        rope_rcp_theta(0.0f),
+        request_indices(nullptr),
+        qo_tile_indices(nullptr),
+        kv_tile_indices(nullptr),
+        merge_indptr(nullptr),
+        o_indptr(nullptr),
+        block_valid_mask(nullptr),
+        kv_chunk_size_ptr(nullptr),
+        max_total_num_rows(0),
+        total_num_rows(nullptr),
+        padded_batch_size(0),
+        partition_kv(false) {}
+
+  __host__ TopKBatchPrefillPagedParams(DTypeQ* q, paged_kv_t<DTypeKV, IdType> paged_kv,
+                                   uint8_t* maybe_custom_mask, IdType* q_indptr,
+                                   IdType* maybe_mask_indptr, IdType* maybe_q_rope_offset,
+                                   DTypeO* o, DTypeO* qk_ptr, float* lse, float* maybe_alibi_slopes,
+                                   uint32_t num_qo_heads, IdType q_stride_n, IdType q_stride_h,
+                                   int32_t window_left, float logits_soft_cap, float sm_scale,
+                                   float rope_scale, float rope_theta)
+      : q(q),
+        paged_kv(paged_kv),
+        maybe_custom_mask(maybe_custom_mask),
+        q_indptr(q_indptr),
+        maybe_mask_indptr(maybe_mask_indptr),
+        maybe_q_rope_offset(maybe_q_rope_offset),
+        o(o),
+        qk_ptr(qk_ptr),
+        lse(lse),
+        maybe_alibi_slopes(maybe_alibi_slopes),
+        group_size(num_qo_heads / paged_kv.num_heads),
+        num_qo_heads(num_qo_heads),
+        q_stride_n(q_stride_n),
+        q_stride_h(q_stride_h),
+        window_left(window_left),
+        logits_soft_cap(logits_soft_cap),
+        sm_scale(sm_scale),
+        rope_rcp_scale(1.f / rope_scale),
+        rope_rcp_theta(1.f / rope_theta),
+        request_indices(nullptr),
+        qo_tile_indices(nullptr),
+        kv_tile_indices(nullptr),
+        merge_indptr(nullptr),
+        o_indptr(nullptr),
+        block_valid_mask(nullptr),
+        kv_chunk_size_ptr(nullptr),
+        max_total_num_rows(0),
+        total_num_rows(nullptr),
+        padded_batch_size(0),
+        partition_kv(false) {}
+
+  __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
+    return q_indptr[batch_idx + 1] - q_indptr[batch_idx];
+  }
+
+  __host__ __device__ __forceinline__ uint32_t get_kv_len(uint32_t batch_idx) const {
+    return paged_kv.get_length(batch_idx);
+  }
+};
+
 }  // namespace flashinfer
 
 #endif  // FLASHINFER_DECODE_PARAMS_CUH_

@@ -171,6 +171,12 @@ template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
 cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
                                                    float* tmp_s, cudaStream_t stream);
 
+template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
+          PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE,
+          typename AttentionVariant, typename Params>
+cudaError_t TopKBatchPrefillWithPagedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
+                                                   float* tmp_s, cudaStream_t stream);
+
 class BatchPrefillHandler {
  public:
   void UpdatePageLockedBufferSize(size_t int_workspace_size_in_bytes) {
@@ -472,6 +478,57 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapper(
                 params.padded_batch_size = plan_info.padded_batch_size;
                 DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
                   return BatchPrefillWithPagedKVCacheDispatched<
+                      CTA_TILE_Q, HEAD_DIM, HEAD_DIM, POS_ENCODING_MODE, USE_FP16_QK_REDUCTION,
+                      MASK_MODE, AttentionVariant>(params, handler->GetTmpV<DTypeO>(),
+                                                   handler->GetTmpS(), stream);
+                })
+              })})})});
+  return cudaSuccess;
+}
+
+template <typename DTypeQ, typename DTypeKV, typename DTypeO, typename IdType>
+cudaError_t TopKBatchPrefillWithPagedKVCacheWrapper(
+    BatchPrefillHandler* handler, DTypeQ* q, IdType* qo_indptr, IdType* q_rope_offset,
+    paged_kv_t<DTypeKV, IdType> paged_kv, DTypeO* o, DTypeO* qk_ptr, float* lse, uint32_t num_qo_heads,
+    bool causal = true, PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
+    bool use_fp16_qk_reduction = false, std::optional<float> maybe_sm_scale = std::nullopt,
+    float rope_scale = 1.f, float rope_theta = 1e4, cudaStream_t stream = nullptr) {
+  const float sm_scale = maybe_sm_scale.value_or(1.f / std::sqrt(float(paged_kv.head_dim)));
+  const uint32_t num_kv_heads = paged_kv.num_heads;
+  const uint32_t head_dim = paged_kv.head_dim;
+  const MaskMode mask_mode = causal ? MaskMode::kCausal : MaskMode::kNone;
+  auto plan_info = handler->GetPlanInfo();
+  DISPATCH_head_dim(
+      head_dim, HEAD_DIM,
+      {DISPATCH_mask_mode(
+          mask_mode, MASK_MODE,
+          {DISPATCH_pos_encoding_mode(
+              pos_encoding_mode, POS_ENCODING_MODE,
+              {DISPATCH_use_fp16_qk_reduction(use_fp16_qk_reduction, USE_FP16_QK_REDUCTION, {
+                using Params = TopKBatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeO, IdType>;
+                using AttentionVariant = DefaultAttention<
+                    /*use_custom_mask=*/(MASK_MODE == MaskMode::kCustom),
+                    /*use_sliding_window=*/false,
+                    /*use_logits_soft_cap=*/false,
+                    /*use_alibi=*/false>;
+                Params params(q, paged_kv, /*custom_mask=*/nullptr, qo_indptr,
+                              /*mask_indptr=*/nullptr, q_rope_offset, o, qk_ptr, lse,
+                              /*alibi_slopes=*/nullptr, num_qo_heads,
+                              /*q_stride_n*/ num_qo_heads * HEAD_DIM, /*q_stride_h*/ HEAD_DIM,
+                              /*window_left=*/-1, /*logits_soft_cap=*/0.f, sm_scale, rope_scale,
+                              rope_theta);
+                params.request_indices = handler->GetRequestIndices<IdType>();
+                params.qo_tile_indices = handler->GetQOTileIndices<IdType>();
+                params.kv_tile_indices = handler->GetKVTileIndices<IdType>();
+                params.o_indptr = handler->GetOIndptr<IdType>();
+                params.kv_chunk_size_ptr = handler->GetKVChunkSizePtr<IdType>();
+                params.merge_indptr = handler->GetMergeIndptr<IdType>();
+                params.block_valid_mask = handler->GetBlockValidMask();
+                params.max_total_num_rows = plan_info.total_num_rows;
+                params.total_num_rows = handler->GetTotalNumRows();
+                params.padded_batch_size = plan_info.padded_batch_size;
+                DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
+                  return TopKBatchPrefillWithPagedKVCacheDispatched<
                       CTA_TILE_Q, HEAD_DIM, HEAD_DIM, POS_ENCODING_MODE, USE_FP16_QK_REDUCTION,
                       MASK_MODE, AttentionVariant>(params, handler->GetTmpV<DTypeO>(),
                                                    handler->GetTmpS(), stream);
