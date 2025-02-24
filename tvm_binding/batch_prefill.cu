@@ -138,7 +138,7 @@ void BatchPrefillWithRaggedKVCacheRun(DLTensor* float_workspace_buffer,
   DISPATCH_context(
       DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
       USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, USE_FP16_QK_REDUCTION, AttentionVariant,
-      RaggedParams, PagedParams, [&] {
+      RaggedParams, PagedParams, TopKParams, [&] {
         RaggedParams params;
 
         params.q = static_cast<DTypeQ*>(q->data) + q->byte_offset / sizeof(DTypeQ);
@@ -291,7 +291,7 @@ void BatchPrefillWithPagedKVCacheRun(DLTensor* float_workspace_buffer,
   DISPATCH_context(
       DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
       USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, USE_FP16_QK_REDUCTION, AttentionVariant,
-      RaggedParams, PagedParams, [&] {
+      RaggedParams, PagedParams, TopKParams, [&] {
         PagedParams params;
 
         params.q = static_cast<DTypeQ*>(q->data) + q->byte_offset / sizeof(DTypeQ);
@@ -473,7 +473,7 @@ void TopKBatchPrefillWithPagedKVCacheRun(
         params.q_indptr =
             static_cast<IdType*>(qo_indptr->data) + qo_indptr->byte_offset / sizeof(IdType);
         params.o = static_cast<DTypeO*>(o->data) + o->byte_offset / sizeof(DTypeO);
-        params.qk_ptr = static_cast<DTypeO*>(qk_inner_product_data->data);
+        params.qk_ptr = static_cast<DTypeO*>(qk_ptr->data);
 
         params.lse = static_cast<float*>(lse->data) + lse->byte_offset / sizeof(float);
         params.num_qo_heads = num_qo_heads;

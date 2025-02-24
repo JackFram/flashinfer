@@ -737,6 +737,50 @@ __device__ __forceinline__ void logits_mask(
   }
 }
 
+template <typename KTraits, typename Params>
+__device__ __forceinline__ void update_qk(
+    const Params& params, typename KTraits::AttentionVariant variant, const uint32_t batch_idx, const uint32_t qk_stride,
+    const uint32_t qo_packed_idx_base, const uint32_t kv_idx_base, const uint32_t qo_len,
+    const uint32_t kv_len, const uint32_t chunk_end, const uint_fastdiv group_size,
+    typename KTraits::DTypeQKAccum (*s_frag)[KTraits::NUM_MMA_KV][8],
+    typename KTraits::DTypeO* qk_ptr) {
+  const uint32_t lane_idx = threadIdx.x, kv_head_idx = blockIdx.z;
+  constexpr uint32_t NUM_MMA_Q = KTraits::NUM_MMA_Q;
+  constexpr uint32_t NUM_MMA_KV = KTraits::NUM_MMA_KV;
+  using DTypeQKAccum = typename KTraits::DTypeQKAccum;
+  using DTypeO = typename KTraits::DTypeO;
+  constexpr MaskMode MASK_MODE = KTraits::MASK_MODE;
+  uint32_t q[NUM_MMA_Q][2], r[NUM_MMA_Q][2];
+#pragma unroll
+  for (uint32_t mma_q = 0; mma_q < NUM_MMA_Q; ++mma_q) {
+#pragma unroll
+    for (uint32_t j = 0; j < 2; ++j) {
+      group_size.divmod(qo_packed_idx_base + mma_q * 16 + lane_idx / 4 + 8 * j, q[mma_q][j],
+                        r[mma_q][j]);
+    }
+  }
+#pragma unroll
+  for (uint32_t mma_q = 0; mma_q < NUM_MMA_Q; ++mma_q) {
+#pragma unroll
+    for (uint32_t mma_kv = 0; mma_kv < NUM_MMA_KV; ++mma_kv) {
+#pragma unroll
+      for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
+        const uint32_t q_idx = q[mma_q][(reg_id % 4) / 2], kv_idx = kv_idx_base + mma_kv * 16 +
+                                                                    2 * (lane_idx % 4) +
+                                                                    8 * (reg_id / 4) + reg_id % 2;
+        const uint32_t qo_head_idx = kv_head_idx * group_size + r[mma_q][(reg_id % 4) / 2];
+        const bool out_of_boundary = (MASK_MODE == MaskMode::kCausal
+                                 ? (kv_idx + qo_len > kv_len + q_idx || (kv_idx >= chunk_end))
+                                 : kv_idx >= chunk_end || q_idx >= qo_len);
+        if (!out_of_boundary) {
+          qk_ptr[kv_idx * qk_stride + qo_head_idx] =
+              static_cast<DTypeO>(s_frag[mma_q][mma_kv][reg_id]);
+        }
+      }
+    }
+  }
+}
+
 template <typename KTraits>
 __device__ __forceinline__ void update_mdo_states(
     typename KTraits::AttentionVariant variant,
@@ -2251,6 +2295,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void TopKBatchPrefillWithPage
     }
     init_states<KTraits>(variant, o_frag, m, d);
 
+    DTypeO* qk_product_ptr = qk_ptr + request_idx * num_qo_heads;
+
     const uint32_t qo_packed_idx_base =
         (qo_tile_idx * NUM_WARPS_Q + get_warp_idx_q<KTraits>()) * NUM_MMA_Q * 16;
     const uint32_t q_stride_n = params.q_stride_n, q_stride_h = params.q_stride_h;
@@ -2388,6 +2434,13 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void TopKBatchPrefillWithPage
             chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>()) * NUM_MMA_KV * 16,
             qo_len, kv_len, chunk_end, group_size, s_frag);
       }
+
+      // update qk_inner_product
+
+      update_qk<KTraits>(
+          params, variant, /*batch_idx=*/request_idx, /*qk_stride=*/num_qo_heads * paged_kv.batch_size, qo_packed_idx_base,
+          chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>()) * NUM_MMA_KV * 16,
+          qo_len, kv_len, chunk_end, group_size, s_frag, qk_product_ptr);
 
       // compute m,d states in online softmax
       update_mdo_states<KTraits>(variant, s_frag, o_frag, m, d);
@@ -2661,8 +2714,9 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
 template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
           PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE,
           typename AttentionVariant, typename Params>
-cudaError_t TopKBatchPrefillWithPagedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
-                                                   float* tmp_s, cudaStream_t stream) {
+cudaError_t TopKBatchPrefillWithPagedKVCacheDispatched(Params params,
+                                                       typename Params::DTypeO* tmp_v, float* tmp_s,
+                                                       cudaStream_t stream) {
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
   using DTypeO = typename Params::DTypeO;
