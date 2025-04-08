@@ -42,6 +42,18 @@ def decode_tag(tag, num_blocks, num_groups):
         event_type,
     )
 
+def decode_pod_tag(tag):
+    sm_idx_tag = tag >> 24
+    block_idx_tag = (tag >> 12) & 0xFFF
+    event_idx = (tag >> 2) & 0x3FF
+    event_type = tag & 0x3
+    return (
+        sm_idx_tag, # sm_idx_tag
+        block_idx_tag, # group_idx
+        event_idx,
+        event_type,
+    )
+
 
 def export_to_perfetto_trace(
     profiler_buffer: torch.Tensor,
@@ -81,6 +93,54 @@ def export_to_perfetto_trace(
         else:
             track = tid.create_track()
             track_map[(block_idx, group_idx, event_idx)] = track
+
+        if event_type == EventType.kBegin.value:
+            track.open(timestamp, event)
+        elif event_type == EventType.kEnd.value:
+            track.close(timestamp)
+        elif event_type == EventType.kInstant.value:
+            track.instant(timestamp, event)
+
+    tgen.flush()
+
+
+def export_to_perfetto_trace_pod(
+    profiler_buffer: torch.Tensor,
+    event_names: List[str],
+    file_name: str,
+) -> None:
+
+    profiler_buffer_host = profiler_buffer.cpu()
+    num_blocks, num_sms = profiler_buffer_host[:1].view(dtype=torch.int32)
+    num_blocks = int(num_blocks)
+    num_sms = int(num_sms)
+    num_groups = 1
+
+    tgen = TraceGenerator(file_name)
+
+    tid_map = {}
+    track_map = {}
+    for sm_idx in range(num_sms):
+        pid = tgen.create_group(f"sm_{sm_idx}")
+        for block_idx in range(num_blocks):
+            tid = pid.create_group(f"block_{block_idx}")
+            tid_map[(sm_idx, block_idx)] = tid
+
+    for i in range(1, len(profiler_buffer_host)):
+        if profiler_buffer_host[i] == 0:
+            continue
+        tag, timestamp = profiler_buffer_host[i : i + 1].view(dtype=torch.uint32)
+        tag = int(tag)
+        timestamp = int(timestamp)
+        sm_idx, block_idx, event_idx, event_type = decode_pod_tag(tag)
+        event = event_names[event_idx]
+        tid = tid_map[(sm_idx, block_idx)]
+
+        if (sm_idx, block_idx, event_idx) in track_map:
+            track = track_map[(sm_idx, block_idx, event_idx)]
+        else:
+            track = tid.create_track()
+            track_map[(sm_idx, block_idx, event_idx)] = track
 
         if event_type == EventType.kBegin.value:
             track.open(timestamp, event)

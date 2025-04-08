@@ -298,6 +298,7 @@ class PODWithPagedKVCacheWrapper:
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
         non_blocking: bool = True,
+        use_profiler: bool = False,
     ) -> None:
         r"""Plan POD's batch decode for given problem specification.
 
@@ -420,6 +421,7 @@ class PODWithPagedKVCacheWrapper:
                 window_left != -1,  # use_sliding_window
                 logits_soft_cap > 0,  # use_logits_soft_cap
                 False,  # use_fp16_qk_reduction
+                use_profiler,
             )
         self._plan_info = self._cached_module.plan(
             self._float_workspace_buffer,
@@ -446,6 +448,7 @@ class PODWithPagedKVCacheWrapper:
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
+        self._use_profiler = use_profiler
 
     begin_forward = plan
 
@@ -483,9 +486,15 @@ class PODWithPagedKVCacheWrapper:
         v_scale: Optional[float] = None,
         return_lse_d: bool = False,
         use_fp16_qk_reduction: bool = False,
+        profiler_buffer: Optional[torch.Tensor] = None,
         *args,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute POD-attention for a batch of requests."""
+        if profiler_buffer is None:
+            if self._use_profiler:
+                raise ValueError(
+                    "Profiler is enabled, profiler_buffer must be provided"
+                )
         # Currently unsupported
         logits_soft_cap_p = None
         logits_soft_cap_d = None
@@ -578,7 +587,11 @@ class PODWithPagedKVCacheWrapper:
             PosEncodingMode[pos_encoding_mode_d].value,
             window_left_d != -1,  # use_sliding_window
             logits_soft_cap_d > 0,  # use_logits_soft_cap
+            self._use_profiler, # use_profiler
         )
+        
+        profiler_args = (profiler_buffer,) if self._use_profiler else ()
+        
         module_getter.run_tensor(
             # Prefill params
             q_p,
@@ -619,6 +632,7 @@ class PODWithPagedKVCacheWrapper:
             sm_scale_d,
             1.0 / rope_scale_d,
             1.0 / rope_theta_d,
+            *profiler_args,
         )
 
         if v_scale is not None:

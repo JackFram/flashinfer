@@ -26,24 +26,38 @@ __device__ __forceinline__ uint32_t get_block_idx() {
 
 __device__ __forceinline__ uint32_t get_num_blocks() { return gridDim.x * gridDim.y * gridDim.z; }
 
+__device__ __forceinline__ uint32_t get_sm_idx() {
+  volatile uint32_t ret;
+  asm volatile("mov.u32 %0, %smid;" : "=r"(ret));
+  return ret;
+}
+
+__device__ __forceinline__ uint32_t get_sm_count() {
+  volatile uint32_t ret;
+  asm volatile("mov.u32 %0, %nsmid;" : "=r"(ret));
+  return ret;
+}
+
 __device__ __forceinline__ uint32_t get_thread_idx() {
   return (threadIdx.z * blockDim.y + threadIdx.y) * blockDim.x + threadIdx.x;
 }
 
-constexpr uint32_t BLOCK_GROUP_IDX_MASK = 0xFFFFF;
+constexpr uint32_t SM_IDX_MASK = 0xFF;
+constexpr uint32_t BLOCK_GROUP_IDX_MASK = 0xFFF;
 constexpr uint32_t EVENT_IDX_MASK = 0x3FF;
 constexpr uint32_t BEGIN_END_MASK = 0x3;
 
 constexpr uint32_t EVENT_IDX_SHIFT = 2;
 constexpr uint32_t BLOCK_GROUP_IDX_SHIFT = 12;
+constexpr uint32_t SM_IDX_SHIFT = 24;
 
 constexpr uint32_t EVENT_BEGIN = 0x0;
 constexpr uint32_t EVENT_END = 0x1;
 constexpr uint32_t EVENT_INSTANT = 0x2;
 
-__device__ __forceinline__ uint32_t encode_tag(uint32_t block_group_idx, uint32_t event_idx,
+__device__ __forceinline__ uint32_t encode_tag(uint32_t sm_idx, uint32_t block_group_idx, uint32_t event_idx,
                                                uint32_t event_type) {
-  return (block_group_idx << BLOCK_GROUP_IDX_SHIFT) | (event_idx << EVENT_IDX_SHIFT) | event_type;
+  return (sm_idx << SM_IDX_SHIFT) | (block_group_idx << BLOCK_GROUP_IDX_SHIFT) | (event_idx << EVENT_IDX_SHIFT) | event_type;
 }
 
 __device__ __forceinline__ uint32_t get_timestamp() {
@@ -56,7 +70,7 @@ struct ProfilerEntry {
   union {
     struct {
       uint32_t nblocks;
-      uint32_t ngroups;
+      uint32_t nsms;
     };
     struct {
       uint32_t tag;
@@ -75,18 +89,18 @@ struct ProfilerEntry {
 
 #define PROFILER_PARAMS_DECL uint64_t* profiler_buffer;
 
-#define PROFILER_INIT(params, smem_storage, closure, group_idx, num_groups,                     \
-                      write_thread_predicate)                                                   \
-  volatile ProfilerEntry entry;                                                                 \
-  if (get_block_idx() == 0 && get_thread_idx() == 0) {                                          \
-    entry.nblocks = get_num_blocks();                                                           \
-    entry.ngroups = num_groups;                                                                 \
-    params.profiler_buffer[0] = entry.raw;                                                      \
-  }                                                                                             \
-  closure.profiler_write_ptr =                                                                  \
-      params.profiler_buffer + 1 + get_block_idx() * num_groups + group_idx;                    \
-  closure.profiler_write_stride = get_num_blocks() * num_groups;                                \
-  closure.profiler_entry_tag_base = encode_tag(get_block_idx() * num_groups + group_idx, 0, 0); \
+#define PROFILER_INIT(params, smem_storage, closure, group_idx, num_groups,                                   \
+                      write_thread_predicate)                                                                 \
+  volatile ProfilerEntry entry;                                                                               \
+  if (get_block_idx() == 0 && get_thread_idx() == 0) {                                                        \
+    entry.nblocks = get_num_blocks();                                                                         \
+    entry.nsms = get_sm_count();                                                                               \
+    params.profiler_buffer[0] = entry.raw;                                                                    \
+  }                                                                                                           \
+  closure.profiler_write_ptr =                                                                                \
+      params.profiler_buffer + 1 + get_block_idx() * num_groups + group_idx;                                  \
+  closure.profiler_write_stride = get_num_blocks() * num_groups;                                              \
+  closure.profiler_entry_tag_base = encode_tag(get_sm_idx(), get_block_idx() * num_groups + group_idx, 0, 0); \
   closure.profiler_write_thread_predicate = write_thread_predicate;
 
 #define PROFILER_EVENT_START(closure, event)                                                  \

@@ -22,6 +22,7 @@
 #include <cstdint>
 
 #include "../page.cuh"
+#include "../profiler.cuh"
 
 namespace flashinfer {
 
@@ -305,6 +306,8 @@ struct BatchPrefillPagedParams {
   uint32_t* total_num_rows;
   uint32_t padded_batch_size;
   bool partition_kv;
+
+  PROFILER_PARAMS_DECL
 
   __host__ BatchPrefillPagedParams()
       : q(nullptr),

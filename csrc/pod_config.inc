@@ -14,6 +14,9 @@
 
 using namespace flashinfer;
 
+#define ADDITIONAL_FUNC_PARAMS POD_ADDITIONAL_FUNC_PARAMS
+#define ADDITIONAL_PARAMS_SETTER POD_ADDITIONAL_PARAMS_SETTER
+
 #define DISPATCH_context(MASK_MODE_P, MASK_MODE_D, DTypeQ, DTypeKV, HEAD_DIM_QK,     \
             USE_SLIDING_WINDOW_P, USE_SLIDING_WINDOW_D, USE_LOGITS_SOFT_CAP, ...)    \
 {                                                                                    \

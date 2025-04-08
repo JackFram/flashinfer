@@ -34,6 +34,19 @@ enum Operation {
   DECODE = 1,
 };
 
+enum class ProfileEventType {
+  kPrefill = 0U,
+  kDecode = 1U,
+  kScheduling = 2U,
+};
+
+struct ProfileClosure {
+
+  PROFILER_CLOSURE_PARAMS_DECL
+  // Profiler
+  __device__ __host__ ProfileClosure() {}
+};
+
 template <typename KTraits_P, typename KTraits_D, bool PartitionKV_P, typename PrefillParams,
           typename DecodeParams>
 __global__ __launch_bounds__(std::max(
@@ -45,6 +58,10 @@ __global__ __launch_bounds__(std::max(
                                                                  decode_params,
                                                              int* tbAssign) {
   extern __shared__ uint8_t smem[];
+
+  ProfileClosure variant;
+  PROFILER_INIT(decode_params, smem, variant, 0, 1, true);
+
   // PREFILL VARS
   const uint32_t num_kv_heads_p = prefill_params.num_kv_heads;
   const uint32_t num_chunks = prefill_params.partition_kv;
@@ -61,6 +78,7 @@ __global__ __launch_bounds__(std::max(
   int op;
   int linear_bid;
   // SM-aware CTA scheduler
+  PROFILER_EVENT_START(variant, ProfileEventType::kScheduling);
   if (threadIdx.x == 0) {
     // TODO_AK: If num_threads dont match, use virtual sub-CTAs.
     // Requires changing block-level sync in main prefill/decode kernels.
@@ -122,7 +140,11 @@ __global__ __launch_bounds__(std::max(
   // Sync to force all threads to wait
   __syncthreads();
 
+  PROFILER_EVENT_END(variant, ProfileEventType::kScheduling);
+
   if (op == PREFILL) {
+    PROFILER_EVENT_START(variant, ProfileEventType::kPrefill);
+    // Prefill operation
     const uint32_t linear_tid = threadIdx.x;
     // Return if threadId exceeds number of threads for this op
     if (linear_tid >= 32 * KTraits_P::NUM_WARPS_Q * KTraits_P::NUM_WARPS_KV) return;
@@ -148,7 +170,10 @@ __global__ __launch_bounds__(std::max(
       SinglePrefillWithKVCacheDevice<KTraits_P>(prefill_params, smem_storage, tid, bx, chunk_idx,
                                                 kv_head_idx, num_chunks, num_kv_heads_p);
     }
+    PROFILER_EVENT_END(variant, ProfileEventType::kPrefill);
   } else /* OP == DECODE */ {
+    PROFILER_EVENT_START(variant, ProfileEventType::kDecode);
+    // Decode operation
     auto& smem_storage = reinterpret_cast<typename KTraits_D::SharedStorage&>(smem);
     // dim3 nblks_d(padded_batch_size_d, 1, num_kv_heads);
     if (linear_bid >= decode_blocks) return;
@@ -166,6 +191,7 @@ __global__ __launch_bounds__(std::max(
 
     BatchPrefillWithPagedKVCacheDevice<KTraits_D>(decode_params, smem_storage, tid, bx, kv_head_idx,
                                                   num_kv_heads_d);
+    PROFILER_EVENT_END(variant, ProfileEventType::kDecode);
   }
 }
 
@@ -405,6 +431,7 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
             // smem_size); printf("Blocks: prefill %d, decode %d, total %d\n", nblks_p, nblks_d,
             // nblks); printf("Threads: prefill %d, decode %d, total %d\n", nthrs_p, nthrs_d,
             // nthrs);
+
             //  ************************************************ /
 
             static int* tbAssign = nullptr;

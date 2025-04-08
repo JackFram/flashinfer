@@ -340,6 +340,7 @@ def get_pod_uri(
     pos_encoding_mode_d: int,
     use_sliding_window_d: bool,
     use_logits_soft_cap_d: bool,
+    use_profiler: bool,
 ) -> str:
     return (
         f"pod_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
@@ -353,7 +354,8 @@ def get_pod_uri(
         f"use_swa_d_{use_sliding_window_d}_"
         f"use_logits_cap_d_{use_logits_soft_cap_d}_"
         f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
-        f"f16qk_{use_fp16_qk_reduction}"
+        f"f16qk_{use_fp16_qk_reduction}_"
+        f"profiler_{use_profiler}"
     )
 
 
@@ -369,6 +371,7 @@ def get_batch_prefill_uri(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    use_profiler: bool = False,
 ) -> str:
     return (
         f"batch_prefill_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
@@ -380,7 +383,8 @@ def get_batch_prefill_uri(
         f"posenc_{pos_encoding_mode}_"
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}_"
-        f"f16qk_{use_fp16_qk_reduction}" + ("_sm90" if backend == "fa3" else "")
+        f"f16qk_{use_fp16_qk_reduction}_" 
+        f"profile_{use_profiler}"+ ("_sm90" if backend == "fa3" else "")
     )
 
 
@@ -506,6 +510,7 @@ def gen_pod_module(
     pos_encoding_mode_d: int,
     use_sliding_window_d: bool,
     use_logits_soft_cap_d: bool,
+    use_profiler: bool,
 ):
     uri = get_pod_uri(
         dtype_q,
@@ -520,6 +525,7 @@ def gen_pod_module(
         pos_encoding_mode_d,
         use_sliding_window_d,
         use_logits_soft_cap_d,
+        use_profiler,
     )
     additional_tensor_names = ["maybe_custom_mask", "maybe_alibi_slopes"]
     additional_tensor_dtypes = ["uint8_t", "float"]
@@ -555,6 +561,7 @@ def gen_pod_module(
         use_sliding_window_d=use_sliding_window_d,
         use_logits_soft_cap_d=use_logits_soft_cap_d,
         use_fp16_qk_reduction=use_fp16_qk_reduction,
+        use_profiler=use_profiler,
     )
 
 
@@ -579,6 +586,7 @@ def gen_customize_pod_module(
     use_sliding_window_d: bool = False,
     use_logits_soft_cap_d: bool = False,
     use_fp16_qk_reduction: bool = False,
+    use_profiler: bool = False,
 ):
     gen_directory = FLASHINFER_GEN_SRC_DIR / uri
 
@@ -655,7 +663,11 @@ def gen_customize_pod_module(
 
     generated_config_path = gen_directory / "pod_config.inc"
     write_if_different(generated_config_path, generated_inc_str)
-    return load_cuda_ops(uri, source_paths)
+    return load_cuda_ops(
+        uri,
+        source_paths,
+        extra_cuda_cflags=(["-DFLASHINFER_ENABLE_PROFILER"] if use_profiler else [])
+    )
 
 
 def gen_batch_decode_module(
@@ -717,6 +729,7 @@ def gen_batch_prefill_module(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    use_profiler: bool = False,
 ):
     uri = get_batch_prefill_uri(
         backend,
@@ -730,6 +743,7 @@ def gen_batch_prefill_module(
         use_sliding_window,
         use_logits_soft_cap,
         use_fp16_qk_reduction,
+        use_profiler=use_profiler,
     )
 
     if backend == "fa2":
@@ -779,6 +793,7 @@ def gen_batch_prefill_module(
         use_sliding_window=use_sliding_window,
         use_logits_soft_cap=use_logits_soft_cap,
         use_fp16_qk_reduction=use_fp16_qk_reduction,
+        use_profiler=use_profiler,
     )
 
 
@@ -1121,6 +1136,7 @@ def gen_customize_batch_prefill_module(
     use_sliding_window: bool = False,
     use_logits_soft_cap: bool = False,
     use_fp16_qk_reduction: bool = False,
+    use_profiler: bool = False,
 ):
     kwargs = {
         "variant_decl": variant_decl,
@@ -1135,6 +1151,7 @@ def gen_customize_batch_prefill_module(
         "use_sliding_window": str(use_sliding_window).lower(),
         "use_logits_soft_cap": str(use_logits_soft_cap).lower(),
         "use_fp16_qk_reduction": str(use_fp16_qk_reduction).lower(),
+        "use_profiler": str(use_profiler).lower(),
     }
     if backend == "auto":
         raise ValueError("backend should not be auto when jit_args is provided")
@@ -1207,6 +1224,7 @@ def gen_customize_batch_prefill_module(
         return load_cuda_ops(
             uri,
             source_paths,
+            extra_cuda_cflags=(["-DFLASHINFER_ENABLE_PROFILER"] if use_profiler else [])
         )
     elif backend == "fa3":
         gen_directory = FLASHINFER_GEN_SRC_DIR / uri
@@ -1278,7 +1296,7 @@ def gen_customize_batch_prefill_module(
         return load_cuda_ops(
             uri,
             source_paths,
-            extra_cuda_cflags=["-gencode=arch=compute_90a,code=sm_90a"],
+            extra_cuda_cflags=(["-gencode=arch=compute_90a,code=sm_90a"])+ (["-DFLASHINFER_ENABLE_PROFILER"] if use_profiler else []),
         )
     else:
         raise ValueError(f"Invalid backend: {backend}")

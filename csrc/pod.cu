@@ -51,7 +51,7 @@ void pod_with_kv_cache_tensor(
     std::optional<at::Tensor> maybe_lse_d, int64_t mask_mode_code_d, int64_t layout_d,
     int64_t window_left_d, std::optional<at::Tensor> maybe_custom_mask_d,
     std::optional<at::Tensor> maybe_mask_indptr_d, std::optional<at::Tensor> maybe_alibi_slopes_d,
-    double logits_soft_cap_d, double sm_scale_d, double rope_rcp_scale_d, double rope_rcp_theta_d) {
+    double logits_soft_cap_d, double sm_scale_d, double rope_rcp_scale_d, double rope_rcp_theta_d ADDITIONAL_FUNC_PARAMS) {
   // Prefill setup
   unsigned int head_dim_qk = q_p.size(2);
   unsigned int kv_len_p, qo_len_p, num_kv_heads, num_qo_heads;
@@ -222,6 +222,8 @@ void pod_with_kv_cache_tensor(
           params.sm_scale = sm_scale_d;
           params.rope_rcp_scale = rope_rcp_scale_d;
           params.rope_rcp_theta = rope_rcp_theta_d;
+
+          ADDITIONAL_PARAMS_SETTER
 
           params.request_indices =
               GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.request_indices_offset);
