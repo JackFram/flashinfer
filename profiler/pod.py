@@ -161,8 +161,8 @@ if __name__ == "__main__":
     )
 
     # Prefill params
-    parser.add_argument("--kv-len-p", type=int, default=128)
-    parser.add_argument("--qo-len-p", type=int, default=128)
+    parser.add_argument("--kv-len-p", type=int, default=12288)
+    parser.add_argument("--qo-len-p", type=int, default=12288)
     
     # Decode params
     parser.add_argument("--batch-size-d", type=int, default=80)

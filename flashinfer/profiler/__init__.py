@@ -112,9 +112,14 @@ def export_to_perfetto_trace_pod(
 
     profiler_buffer_host = profiler_buffer.cpu()
     num_blocks, num_sms = profiler_buffer_host[:1].view(dtype=torch.int32)
+    num_decode_blocks, num_prefill_blocks = profiler_buffer_host[1:2].view(dtype=torch.int32)
     num_blocks = int(num_blocks)
     num_sms = int(num_sms)
+    num_decode_blocks = int(num_decode_blocks)
+    num_prefill_blocks = int(num_prefill_blocks)
     num_groups = 1
+
+    print(f"num_blocks: {num_blocks}, num_sms: {num_sms}, num_decode_blocks: {num_decode_blocks}, num_prefill_blocks: {num_prefill_blocks}")
 
     tgen = TraceGenerator(file_name)
 

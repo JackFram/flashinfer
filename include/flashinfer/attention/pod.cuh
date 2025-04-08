@@ -60,7 +60,6 @@ __global__ __launch_bounds__(std::max(
   extern __shared__ uint8_t smem[];
 
   ProfileClosure variant;
-  PROFILER_INIT(decode_params, smem, variant, 0, 1, true);
 
   // PREFILL VARS
   const uint32_t num_kv_heads_p = prefill_params.num_kv_heads;
@@ -74,6 +73,8 @@ __global__ __launch_bounds__(std::max(
   // THREADBLOCKS
   const uint32_t prefill_blocks = num_kv_heads_p * xsize * (PartitionKV_P ? num_chunks : 1);
   const uint32_t decode_blocks = padded_bsize * num_kv_heads_d;
+
+  PROFILER_INIT(decode_params, smem, variant, 0, 1, decode_blocks, prefill_blocks, true);
 
   int op;
   int linear_bid;
