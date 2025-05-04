@@ -18,6 +18,7 @@
 
 #include "mask.cuh"
 #include "persistent_template.cuh"
+#include "persistent_worker.cuh"
 #include "prefill.cuh"
 
 namespace flashinfer {
@@ -147,6 +148,7 @@ struct BlockBatchPagedAttentionPersistent {
 #pragma unroll 1
     for (IdType work_idx = work_indptr[blockIdx.y]; work_idx < work_indptr[blockIdx.y + 1];
          ++work_idx) {
+      
       const auto [batch_idx, q_indptr, kv_indptr, partial_indptr, q_len, kv_len, packed_qo_start,
                   kv_start, kv_end, kv_head_idx] = get_block_coord(params, work_idx);
 
@@ -179,15 +181,35 @@ struct BlockBatchPagedAttentionPersistent {
       uint32_t block_iter_base = kv_indptr * block_size + kv_start;
       // last kv tile
       __syncthreads();
+
       uint32_t packed_kv_bound = kv_indptr * block_size + kv_len;
 
       prefetch_offest<KTraits>(block_iter_base + kv_tile_idx * CTA_TILE_KV, packed_kv_bound,
                                kv_head_idx, k_stride_page, k_stride_h, k_stride_n, block_size,
                                kv_indices, thr_local_kv_offset);
+
+      // uint32_t start_time, end_time;
+      // cp_async::commit_group();
+      // cp_async::wait_group<0>();
+      // start_time = clock();
+      // __threadfence_block();
+      // __syncthreads();
+
       page_load_kv<false, KTraits>(smem_storage, &k_smem_offset_w, k,
                                    kv_start + kv_tile_idx * CTA_TILE_KV, thr_local_kv_offset,
                                    kv_end);
       cp_async::commit_group();
+
+
+      // cp_async::commit_group();
+      // cp_async::wait_group<0>();
+      // __syncthreads();
+      // __threadfence_block();
+      // end_time = clock();
+      // if(blockIdx.y == 0 && threadIdx.x == 0 && CTA_TILE_Q == 128) {
+      //   printf("q_indptr: %d, kv_head_idx: %d, mixed load time: %d\n", q_indptr, kv_head_idx, end_time - start_time);
+      // }
+
       page_load_kv<true, KTraits>(smem_storage, &v_smem_offset_w, v,
                                   kv_start + kv_tile_idx * CTA_TILE_KV, thr_local_kv_offset,
                                   kv_end);
@@ -202,7 +224,6 @@ struct BlockBatchPagedAttentionPersistent {
                                      k_stride_n, block_size, kv_indices, thr_local_kv_offset);
             cp_async::wait_group<1>();
             __syncthreads();
-
             gemm_qk<KTraits>(&q_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
             if constexpr (WITH_MASK) {
               logits_mask<KTraits>(
@@ -276,7 +297,7 @@ cudaError_t BatchPagedAttentionPersistent(const Params params_1, const Params pa
   constexpr uint32_t NUM_WARPS_Q_1 = get_num_warps_q(CTA_TILE_Q_1);
   constexpr uint32_t NUM_WARPS_KV_1 = get_num_warps_kv(CTA_TILE_Q_1);
   constexpr uint32_t NUM_MMA_Q_1 = get_num_mma_q(CTA_TILE_Q_1);
-  constexpr uint32_t NUM_MMA_KV_1 = 4;
+  constexpr uint32_t NUM_MMA_KV_1 = 4;  // TODO(Zhihao): Modify this and profile
   constexpr uint32_t NUM_MMA_D_QK = HEAD_DIM_QK / 16;
   constexpr uint32_t NUM_MMA_D_VO = HEAD_DIM_VO / 16;
   using KTraits1 = KernelTraits<MASK_MODE, CTA_TILE_Q_1, NUM_MMA_Q_1, NUM_MMA_KV_1, NUM_MMA_D_QK,
@@ -297,9 +318,386 @@ cudaError_t BatchPagedAttentionPersistent(const Params params_1, const Params pa
                                          BlockBatchPagedAttentionPersistent<KTraits2, Params>>;
   FLASHINFER_CUDA_CALL(
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-
   dim3 nblks(num_blks_x, num_blks_y);
   dim3 nthrs(max(KTraits1::NUM_THREADS, KTraits2::NUM_THREADS));
+  void* args[] = {(void*)&params_1, (void*)&params_2};
+
+  FLASHINFER_CUDA_CALL(
+      cudaLaunchCooperativeKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+
+  return cudaSuccess;
+}
+
+template <typename PipeKTraits, typename Params>
+__global__ __launch_bounds__(PipeKTraits::NUM_THREADS) void PipeBatchPagedAttentionPersistentKernel(
+    const __grid_constant__ Params params_prefill, const __grid_constant__ Params params_decode) {
+  using DTypeQ = typename Params::DTypeQ;
+  using DTypeKV = typename Params::DTypeKV;
+  using DTypeO = typename Params::DTypeO;
+  using IdType = typename Params::IdType;
+  using DTypeQKAccum = typename PipeKTraits::DTypeQKAccum;
+  using AttentionVariant = typename PipeKTraits::AttentionVariant;
+
+  extern __shared__ uint8_t smem[];
+  auto& smem_storage = reinterpret_cast<typename PipeKTraits::SharedStorage&>(smem);
+
+  PersistentWorker<typename PipeKTraits::KTraitsP, Params> prefill_worker(params_prefill);
+  PersistentWorker<typename PipeKTraits::KTraitsD, Params> decode_worker(params_decode);
+
+  IdType* work_indptr_p = params_prefill.work_indptr;
+  IdType* work_indptr_d = params_decode.work_indptr;
+  IdType work_idx_p = work_indptr_p[blockIdx.y];
+  IdType work_idx_d = work_indptr_d[blockIdx.y];
+
+  // // Prefill and Decode tile fusion
+  // smem_t<prefill_worker.SWIZZLE_MODE_Q> pipe_q_p_smem(smem_storage.pipe_q_p_smem);
+  // smem_t<prefill_worker.SWIZZLE_MODE_Q> pipe_q_d_smem(smem_storage.pipe_q_d_smem);
+  // smem_t<prefill_worker.SWIZZLE_MODE_KV> stage1_smem(smem_storage.pipe_kv_smem1);
+  // smem_t<prefill_worker.SWIZZLE_MODE_KV> stage2_smem(smem_storage.pipe_kv_smem2);
+  // smem_t<prefill_worker.SWIZZLE_MODE_Q> pipe_o_p_smem(smem_storage.smem_o_p);
+  // smem_t<prefill_worker.SWIZZLE_MODE_Q> pipe_o_d_smem(smem_storage.smem_o_d);
+
+  // while (work_idx_p < work_indptr_p[blockIdx.y + 1] && work_idx_d < work_indptr_d[blockIdx.y + 1]) {
+  //   prefill_worker.set_work_tile_info(params_prefill, work_idx_p);
+  //   decode_worker.set_work_tile_info(params_decode, work_idx_d);
+
+  //   prefill_worker.init_kv_info();
+  //   decode_worker.init_kv_info();
+  //   __syncthreads();
+  //   prefill_worker.prefetch_offset(0);
+  //   decode_worker.prefetch_offset(0);
+
+  //   prefill_worker.page_load_k(&stage1_smem, 0);
+  //   cp_async::commit_group();
+  //   decode_worker.page_load_k(&stage2_smem, 0);
+  //   cp_async::commit_group();
+
+  //   while(prefill_worker.kv_tile_idx + 1 > prefill_worker.NUM_STAGES && decode_worker.kv_tile_idx + 1 > decode_worker.NUM_STAGES) {
+  //     cp_async::wait_group<1>();
+  //     // __syncthreads();
+  //     prefill_worker.gemm_qk(&pipe_q_p_smem, &stage1_smem);
+  //     prefill_worker.page_load_v(&stage1_smem, 0);
+  //     cp_async::commit_group();
+  //     if(prefill_worker.kv_tile_idx >= prefill_worker.mask_tile_idx && prefill_worker.kv_tile_idx > 0) {
+  //       prefill_worker.logits_mask(params_prefill);
+  //     }
+  //     prefill_worker.update_mdo_states();
+  //     __syncthreads();
+  //     cp_async::wait_group<1>();
+  //     decode_worker.gemm_qk(&pipe_q_d_smem, &stage2_smem);
+  //     decode_worker.page_load_v(&stage2_smem, 0);
+  //     cp_async::commit_group();
+  //     // No mask for decode tiles?
+  //     if(decode_worker.kv_tile_idx >= decode_worker.mask_tile_idx && decode_worker.kv_tile_idx > 0) {
+  //       decode_worker.logits_mask(params_decode);
+  //     }
+  //     decode_worker.update_mdo_states();
+  //     __syncthreads();
+
+  //     prefill_workers.prefetch_offset(1);
+  //     decode_worker.prefetch_offset(1);
+  //     cp_async::wait_group<1>();
+  //     prefill_worker.gemm_pv(&stage1_smem);
+  //     __syncthreads();
+  //     prefill_worker.page_load_k(&stage1_smem, 1);
+  //     cp_async::commit_group();
+  //     cp_async::wait_group<1>();
+  //     decode_worker.gemm_pv(&stage2_smem);
+  //     __syncthreads();
+  //     decode_worker.page_load_k(&stage2_smem, 1);
+  //     cp_async::commit_group();
+
+  //     prefill_worker.kv_tile_idx--;
+  //     decode_worker.kv_tile_idx--;
+  //   }
+
+  //   cp_async::wait_group<1>();
+  //   prefill_worker.gemm_qk(&pipe_q_p_smem, &stage1_smem);
+  //   prefill_worker.page_load_v(&stage1_smem, 0);
+  //   cp_async::commit_group();
+  //   if(prefill_worker.kv_tile_idx >= prefill_worker.mask_tile_idx && prefill_worker.kv_tile_idx > 0) {
+  //     prefill_worker.logits_mask(params_prefill);
+  //   }
+  //   prefill_worker.update_mdo_states();
+  //   __syncthreads();
+  //   cp_async::wait_group<1>();
+  //   decode_worker.gemm_qk(&pipe_q_d_smem, &stage2_smem);
+  //   decode_worker.page_load_v(&stage2_smem, 0);
+  //   cp_async::commit_group();
+  //   if(decode_worker.kv_tile_idx >= decode_worker.mask_tile_idx && decode_worker.kv_tile_idx > 0) {
+  //     decode_worker.logits_mask(params_decode);
+  //   }
+  //   decode_worker.update_mdo_states();
+  //   __syncthreads();
+  //   if(prefill_worker.kv_tile_idx > NUM_STAGES){
+  //     prefill_worker.prefetch_offset(1);
+  //   }
+  //   else if(decode_worker.kv_tile_idx > NUM_STAGES) {
+  //     decode_worker.prefetch_offset(1);
+  //   }
+  //   cp_async::wait_group<1>();
+  //   prefill_worker.gemm_pv(&stage1_smem);
+  //   __syncthreads();
+  //   if(prefill_worker.kv_tile_idx > NUM_STAGES){
+  //     prefill_worker.page_load_k(&stage1_smem, 1);
+  //   }
+  //   else if(decode_worker.kv_tile_idx > NUM_STAGES) {
+  //     decode_worker.page_load_k(&pipe_q_p_smem, 1);
+  //   }
+  //   cp_async::commit_group();
+  //   cp_async::wait_group<1>();
+  //   decode_worker.gemm_pv(&stage2_smem);
+  //   if(prefill_worker.kv_tile_idx > NUM_STAGES){
+  //     prefill_worker.page_load_v(&stage2_smem, 1);
+  //   }
+  //   else if(decode_worker.kv_tile_idx > NUM_STAGES) {
+  //     decode_worker.page_load_v(&stage2_smem, 1);
+  //   }
+  //   cp_async::commit_group();
+
+  //   prefill_worker.kv_tile_idx--;
+  //   decode_worker.kv_tile_idx--;
+  //   __syncthreads();
+
+  //   if(prefill_worker.kv_tile_idx > 0){
+  //     LOOP_SPLIT_MASK(prefill_worker.kv_tile_idx, prefill_worker.kv_tile_idx >= prefill_worker.mask_tile_idx && prefill_worker.kv_tile_idx > 0,
+  //       prefill_worker.kv_tile_idx + 1 > prefill_worker.NUM_STAGES, {
+  //       prefill_worker.prefetch_offset(1);
+  //       cp_async::wait_group<1>();
+  //       __syncthreads();
+  //       prefill_worker.gemm_qk(&pipe_q_p_smem, &stage1_smem);
+  //       prefill_worker.logits_mask(params_prefill);
+  //       prefill_worker.update_mdo_states();
+  //       __syncthreads();
+  //       prefill_worker.page_load_k(&stage1_smem, 1);
+  //       cp_async::commit_group();
+  //       cp_async::wait_group<1>();
+
+  //       __syncthreads();
+  //       prefill_worker.gemm_pv(&stage2_smem);
+  //       __syncthreads();
+
+  //       prefill_worker.page_load_v(&stage2_smem, 1);
+  //       cp_async::commit_group();
+  //     });
+
+  //     cp_async::wait_group<0>();
+  //     __syncthreads();
+
+  //     for (; prefill_worker.kv_tile_idx >= 0; --prefill_worker.kv_tile_idx) {
+  //       prefill_worker.gemm_qk(&pipe_q_p_smem, &stage1_smem);
+  //       prefill_worker.logits_mask(params_prefill);
+  //       prefill_worker.update_mdo_states();
+  //       prefill_worker.gemm_pv(&stage2_smem);
+  //     }
+
+  //     __syncthreads();
+  //     prefill_worker.epilogue(smem_storage.cta_sync_o_smem, smem_storage.cta_sync_md_smem, &pipe_o_p_smem);
+
+  //   }
+
+  //   if(decode_worker.kv_tile_idx > 0){
+  //     LOOP_SPLIT_MASK(decode_worker.kv_tile_idx, decode_worker.kv_tile_idx >= decode_worker.mask_tile_idx && decode_worker.kv_tile_idx > 0,
+  //       decode_worker.kv_tile_idx + 1 > decode_worker.NUM_STAGES, {
+  //       decode_worker.prefetch_offset(1);
+  //       cp_async::wait_group<1>();
+  //       __syncthreads();
+  //       decode_worker.gemm_qk(&pipe_q_d_smem, &pipe_q_p_smem);
+  //       decode_worker.logits_mask(params_decode);
+  //       decode_worker.update_mdo_states();
+  //       __syncthreads();
+  //       decode_worker.page_load_k(&pipe_q_p_smem, 1);
+  //       cp_async::commit_group();
+  //       cp_async::wait_group<1>();
+
+  //       __syncthreads();
+  //       decode_worker.gemm_pv(&stage2_smem);
+  //       __syncthreads();
+
+  //       decode_worker.page_load_v(&stage2_smem, 1);
+  //       cp_async::commit_group();
+  //     });
+
+  //     cp_async::wait_group<0>();
+  //     __syncthreads();
+
+  //     for (; decode_worker.kv_tile_idx >= 0; --decode_worker.kv_tile_idx) {
+  //       decode_worker.gemm_qk(&pipe_q_d_smem, &pipe_q_p_smem);
+  //       decode_worker.logits_mask(params_decode);
+  //       decode_worker.update_mdo_states();
+  //       decode_worker.gemm_pv(&stage2_smem);
+  //     }
+
+  //     __syncthreads();
+  //     decode_worker.epilogue(smem_storage.cta_sync_o_smem, smem_storage.cta_sync_md_smem, &pipe_o_d_smem);
+  //   }
+
+  //   work_idx_p++;
+  //   work_idx_d++;
+  // }
+
+  // Clean up the remaining Prefill work tile
+  smem_t<prefill_worker.SWIZZLE_MODE_Q> q_p_smem(smem_storage.pipe_q_p_smem);
+  smem_t<prefill_worker.SWIZZLE_MODE_KV> k_p_smem(smem_storage.pipe_kv_smem1);
+  smem_t<prefill_worker.SWIZZLE_MODE_KV> v_p_smem(smem_storage.pipe_kv_smem2);
+  smem_t<prefill_worker.SWIZZLE_MODE_Q> o_p_smem(smem_storage.smem_o_p);
+
+  while (work_idx_p < work_indptr_p[blockIdx.y+1]) {
+
+    prefill_worker.set_work_tile_info(params_prefill, work_idx_p);
+    prefill_worker.load_q_global_smem(&q_p_smem);
+
+    prefill_worker.init_kv_info();
+    __syncthreads();
+
+    prefill_worker.prefetch_offset(0);
+
+    // uint32_t start_time, end_time;
+    // cp_async::commit_group();
+    // cp_async::wait_group<0>();
+    // start_time = clock();
+    // __threadfence_block();
+    // __syncthreads();
+
+    prefill_worker.page_load_k(&k_p_smem, 0);
+    cp_async::commit_group();
+
+    // cp_async::commit_group();
+    // cp_async::wait_group<0>();
+    // __syncthreads();
+    // __threadfence_block();
+    // end_time = clock();
+    // if(blockIdx.y == 0 && threadIdx.x == 0) {
+    //   printf("q_indptr: %d, kv_head_idx: %d, pipe load time: %d\n", prefill_worker.q_indptr, prefill_worker.kv_head_idx, end_time - start_time);
+    // }
+
+    prefill_worker.page_load_v(&v_p_smem, 0);
+    cp_async::commit_group();
+
+
+    // LOOP_SPLIT_MASK(prefill_worker.kv_tile_idx, prefill_worker.kv_tile_idx >= prefill_worker.mask_tile_idx && prefill_worker.kv_tile_idx > 0,
+    //   prefill_worker.kv_tile_idx + 1 > prefill_worker.NUM_STAGES, {
+    //   prefill_worker.prefetch_offset(1);
+    //   cp_async::wait_group<1>();
+    //   __syncthreads();
+    //   prefill_worker.gemm_qk(&q_p_smem, &k_p_smem);
+    //   prefill_worker.logits_mask(params_prefill);
+    //   prefill_worker.update_mdo_states();
+    //   __syncthreads();
+    //   prefill_worker.page_load_k(&k_p_smem, 1);
+    //   cp_async::commit_group();
+    //   cp_async::wait_group<1>();
+
+    //   __syncthreads();
+    //   prefill_worker.gemm_pv(&v_p_smem);
+    //   __syncthreads();
+
+    //   prefill_worker.page_load_v(&v_p_smem, 1);
+    //   cp_async::commit_group();
+    // });
+
+    // cp_async::wait_group<0>();
+    // __syncthreads();
+
+    // for (; prefill_worker.kv_tile_idx >= 0; --prefill_worker.kv_tile_idx) {
+    //   prefill_worker.gemm_qk(&q_p_smem, &k_p_smem);
+    //   prefill_worker.logits_mask(params_prefill);
+    //   prefill_worker.update_mdo_states();
+    //   prefill_worker.gemm_pv(&v_p_smem);
+    // }
+
+    // __syncthreads();
+    // prefill_worker.epilogue(smem_storage.cta_sync_o_smem, smem_storage.cta_sync_md_smem, &o_p_smem);
+    work_idx_p++;
+  }
+
+  // __syncthreads();
+
+  // // Clean up the remaining Decode work tile
+  // smem_t<decode_worker.SWIZZLE_MODE_Q> q_d_smem(smem_storage.pipe_q_d_smem);
+  // smem_t<decode_worker.SWIZZLE_MODE_KV> k_d_smem(smem_storage.pipe_q_p_smem);
+  // smem_t<decode_worker.SWIZZLE_MODE_KV> v_d_smem(smem_storage.pipe_kv_smem2);
+  // smem_t<decode_worker.SWIZZLE_MODE_Q> o_d_smem(smem_storage.smem_o_d);
+  while (work_idx_d < work_indptr_d[blockIdx.y + 1]) {
+    decode_worker.set_work_tile_info(params_decode, work_idx_d);
+  //   decode_worker.load_q_global_smem(&q_d_smem);
+  //   decode_worker.init_kv_info();
+  //   __syncthreads();
+  //   decode_worker.prefetch_offset(0);
+  //   decode_worker.page_load_k(&k_d_smem, 0);
+  //   cp_async::commit_group();
+  //   decode_worker.page_load_v(&v_d_smem, 0);
+  //   cp_async::commit_group();
+
+  //   LOOP_SPLIT_MASK(decode_worker.kv_tile_idx, decode_worker.kv_tile_idx >= decode_worker.mask_tile_idx && decode_worker.kv_tile_idx > 0,
+  //     decode_worker.kv_tile_idx + 1 > decode_worker.NUM_STAGES, {
+  //     decode_worker.prefetch_offset(1);
+  //     cp_async::wait_group<1>();
+  //     __syncthreads();
+  //     decode_worker.gemm_qk(&q_d_smem, &k_d_smem);
+  //     decode_worker.logits_mask(params_decode);
+  //     decode_worker.update_mdo_states();
+  //     __syncthreads();
+  //     decode_worker.page_load_k(&k_d_smem, 1);
+  //     cp_async::commit_group();
+  //     cp_async::wait_group<1>();
+
+  //     __syncthreads();
+  //     decode_worker.gemm_pv(&v_d_smem);
+  //     __syncthreads();
+
+  //     decode_worker.page_load_v(&v_d_smem, 1);
+  //     cp_async::commit_group();
+  //   });
+
+  //   cp_async::wait_group<0>();
+  //   __syncthreads();
+
+  //   for (; decode_worker.kv_tile_idx >= 0; --decode_worker.kv_tile_idx) {
+  //     decode_worker.gemm_qk(&q_d_smem, &k_d_smem);
+  //     decode_worker.logits_mask(params_decode);
+  //     decode_worker.update_mdo_states();
+  //     decode_worker.gemm_pv(&v_d_smem);
+  //   }
+
+  //   __syncthreads();
+  //   decode_worker.epilogue(smem_storage.cta_sync_o_smem, smem_storage.cta_sync_md_smem, &o_d_smem);
+    work_idx_d++;
+  }
+}
+
+template <uint32_t CTA_TILE_Q_1, uint32_t CTA_TILE_Q_2, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
+          MaskMode MASK_MODE, typename AttentionVariant, typename Params>
+cudaError_t PipePagedAttentionPersistent(const Params params_1, const Params params_2,
+                                         const uint32_t num_blks_x, const uint32_t num_blks_y,
+                                         const cudaStream_t stream) {
+  using DTypeQ = typename Params::DTypeQ;
+  using DTypeKV = typename Params::DTypeKV;
+  using DTypeO = typename Params::DTypeO;
+  using IdType = typename Params::IdType;
+  constexpr uint32_t NUM_WARPS_Q_1 = get_num_warps_q(CTA_TILE_Q_1);
+  constexpr uint32_t NUM_WARPS_KV_1 = get_num_warps_kv(CTA_TILE_Q_1);
+  constexpr uint32_t NUM_MMA_Q_1 = get_num_mma_q(CTA_TILE_Q_1);
+  constexpr uint32_t NUM_MMA_KV_1 = 4;
+  constexpr uint32_t NUM_MMA_D_QK = HEAD_DIM_QK / 16;
+  constexpr uint32_t NUM_MMA_D_VO = HEAD_DIM_VO / 16;
+  constexpr uint32_t NUM_WARPS_Q_2 = get_num_warps_q(CTA_TILE_Q_2);
+  constexpr uint32_t NUM_WARPS_KV_2 = get_num_warps_kv(CTA_TILE_Q_2);
+  constexpr uint32_t NUM_MMA_Q_2 = get_num_mma_q(CTA_TILE_Q_2);
+  constexpr uint32_t NUM_MMA_KV_2 = 2;
+
+  using PipeKTraits = PipeKernelTraits<
+      MASK_MODE, CTA_TILE_Q_1, NUM_MMA_Q_1, NUM_MMA_KV_1, NUM_WARPS_Q_1, NUM_WARPS_KV_1,  // Prefill
+      MASK_MODE, CTA_TILE_Q_2, NUM_MMA_Q_2, NUM_MMA_KV_2, NUM_WARPS_Q_2, NUM_WARPS_KV_2,  // Decode
+      NUM_MMA_D_QK, NUM_MMA_D_VO, PosEncodingMode::kNone, DTypeQ, DTypeKV, DTypeO, float, IdType,
+      AttentionVariant>;
+
+  size_t smem_size = sizeof(typename PipeKTraits::SharedStorage);
+  auto kernel = PipeBatchPagedAttentionPersistentKernel<PipeKTraits, Params>;
+  FLASHINFER_CUDA_CALL(
+      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+  dim3 nblks(num_blks_x, num_blks_y);
+  dim3 nthrs(PipeKTraits::NUM_THREADS);
   void* args[] = {(void*)&params_1, (void*)&params_2};
 
   FLASHINFER_CUDA_CALL(
@@ -380,7 +778,6 @@ cudaError_t BatchAttentionScoreReductionPersisitent(const Params params, const u
   using IdType = typename Params::IdType;
   constexpr uint32_t NUM_THREADS = 128;
   auto kernel = BatchAttentionScoreReductionPersisitentKernel<Params, NUM_THREADS>;
-
   dim3 nblks(num_blks_x, num_blks_y);
   dim3 nthrs(NUM_THREADS);
   void* args[] = {(void*)&params};

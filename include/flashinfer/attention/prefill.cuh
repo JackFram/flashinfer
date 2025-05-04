@@ -158,6 +158,88 @@ struct KernelTraits {
 #endif
 };
 
+
+template <uint32_t NUM_WARPS_KV, uint32_t CTA_TILE_Q_P, uint32_t CTA_TILE_Q_D, 
+          uint32_t CTA_TILE_KV_P, uint32_t CTA_TILE_KV_D, uint32_t HEAD_DIM_QK,
+          uint32_t HEAD_DIM_VO, typename DTypeQ, typename DTypeKV, typename DTypeO>
+struct PipeSharedStorageQKVO {
+  union {
+    struct {
+      alignas(16) DTypeQ pipe_q_p_smem[CTA_TILE_Q_P * HEAD_DIM_QK];
+      alignas(16) DTypeQ pipe_q_d_smem[CTA_TILE_Q_D * HEAD_DIM_QK];
+      alignas(16) DTypeKV pipe_kv_smem1[CTA_TILE_KV_P * HEAD_DIM_QK];
+      alignas(16) DTypeKV pipe_kv_smem2[CTA_TILE_KV_D * HEAD_DIM_QK];
+    };
+    struct {  // NOTE(Zhihao): figure out this part when adding reudction
+      alignas(16) float cta_sync_o_smem[NUM_WARPS_KV * CTA_TILE_Q_D * HEAD_DIM_VO];
+      alignas(16) float2 cta_sync_md_smem[NUM_WARPS_KV * CTA_TILE_Q_D];
+    };
+    alignas(16) DTypeO smem_o_p[CTA_TILE_Q_P * HEAD_DIM_VO];
+    alignas(16) DTypeO smem_o_d[CTA_TILE_Q_D * HEAD_DIM_VO];
+  };
+};
+
+template <MaskMode MASK_MODE_P_, uint32_t CTA_TILE_Q_P_, uint32_t NUM_MMA_Q_P_, uint32_t NUM_MMA_KV_P_,
+          uint32_t NUM_WARPS_Q_P_, uint32_t NUM_WARPS_KV_P_,
+          MaskMode MASK_MODE_D_, uint32_t CTA_TILE_Q_D_, uint32_t NUM_MMA_Q_D_, uint32_t NUM_MMA_KV_D_,
+          uint32_t NUM_WARPS_Q_D_, uint32_t NUM_WARPS_KV_D_, 
+          uint32_t NUM_MMA_D_QK_, uint32_t NUM_MMA_D_VO_, 
+          PosEncodingMode POS_ENCODING_MODE_, typename DTypeQ_, typename DTypeKV_, typename DTypeO_, 
+          typename DTypeQKAccum_, typename IdType_, typename AttentionVariant_>
+struct PipeKernelTraits {
+
+  using KTraitsP = KernelTraits<MASK_MODE_P_, CTA_TILE_Q_P_, NUM_MMA_Q_P_, NUM_MMA_KV_P_,
+                                    NUM_MMA_D_QK_, NUM_MMA_D_VO_, NUM_WARPS_Q_P_, NUM_WARPS_KV_P_,
+                                    POS_ENCODING_MODE_, DTypeQ_, DTypeKV_, DTypeO_, DTypeQKAccum_,
+                                    IdType_, AttentionVariant_>;
+
+  using KTraitsD = KernelTraits<MASK_MODE_D_, CTA_TILE_Q_D_, NUM_MMA_Q_D_, NUM_MMA_KV_D_,
+                                    NUM_MMA_D_QK_, NUM_MMA_D_VO_, NUM_WARPS_Q_D_, NUM_WARPS_KV_D_,
+                                    POS_ENCODING_MODE_, DTypeQ_, DTypeKV_, DTypeO_, DTypeQKAccum_,
+                                    IdType_, AttentionVariant_>; 
+
+  static constexpr uint32_t NUM_THREADS = std::max(KTraitsP::NUM_THREADS, KTraitsD::NUM_THREADS);
+  
+  using DTypeQ = DTypeQ_;
+  using DTypeKV = DTypeKV_;
+  using DTypeO = DTypeO_;
+  using DTypeQKAccum = DTypeQKAccum_;
+  using IdType = IdType_;
+  using AttentionVariant = AttentionVariant_;
+
+  // static constexpr bool IsInvalid() {
+  //   return ((NUM_MMA_D_VO < 4) || (NUM_MMA_D_VO == 4 && NUM_MMA_KV % 2 == 1) ||
+  //           (POS_ENCODING_MODE == PosEncodingMode::kRoPELlama && NUM_MMA_D_VO > 4 &&
+  //            NUM_MMA_D_VO % (2 * NUM_WARPS_Q) != 0) ||
+  //           (NUM_MMA_Q * (8 * NUM_MMA_D_VO + 2 * sizeof(DTypeQKAccum) * NUM_MMA_KV) >= 256) ||
+  //           (sizeof(DTypeKV) == 1 && NUM_MMA_KV * 2 % NUM_WARPS_Q != 0) ||
+  //           (sizeof(DTypeKV) == 1 && POS_ENCODING_MODE == PosEncodingMode::kRoPELlama));
+  // }
+
+  using SharedStorage = PipeSharedStorageQKVO<NUM_WARPS_KV_D_, CTA_TILE_Q_P_, CTA_TILE_Q_D_, 
+                                          KTraitsP::CTA_TILE_KV, KTraitsD::CTA_TILE_KV, KTraitsP::HEAD_DIM_QK,
+                                          KTraitsP::HEAD_DIM_VO, DTypeQ, DTypeKV, DTypeO>;
+#ifdef FP16_QK_REDUCTION_SUPPORTED
+  template <typename DT>
+  static constexpr DT getNegInf() {
+    if constexpr (std::is_same<DT, __half>::value) {
+      return std::bit_cast<half>(fp16_ieee_from_fp32_value(-math::inf));
+    } else {
+      return static_cast<DTypeQKAccum>(-math::inf);
+    }
+  }
+
+  static constexpr DTypeQKAccum MaskFillValue =
+      AttentionVariant::use_softmax ? getNegInf<DTypeQKAccum>() : DTypeQKAccum(0.f);
+#else
+  static_assert(!std::is_same<DTypeQKAccum, __half>::value,
+                "Set -DFP16_QK_REDUCTION_SUPPORTED and install boost_math "
+                "then recompile to support fp16 reduction");
+  static constexpr DTypeQKAccum MaskFillValue =
+      AttentionVariant::use_softmax ? DTypeQKAccum(-math::inf) : DTypeQKAccum(0.f);
+#endif
+};
+
 namespace {
 
 template <typename KTraits>
