@@ -148,7 +148,7 @@ struct BlockBatchPagedAttentionPersistent {
 #pragma unroll 1
     for (IdType work_idx = work_indptr[blockIdx.y]; work_idx < work_indptr[blockIdx.y + 1];
          ++work_idx) {
-      
+
       const auto [batch_idx, q_indptr, kv_indptr, partial_indptr, q_len, kv_len, packed_qo_start,
                   kv_start, kv_end, kv_head_idx] = get_block_coord(params, work_idx);
 
@@ -166,6 +166,7 @@ struct BlockBatchPagedAttentionPersistent {
                                   q_stride_n, q_stride_h, gqa_group_size);
 
       smem_t<SWIZZLE_MODE_KV> k_smem(smem_storage->k_smem), v_smem(smem_storage->v_smem);
+
       int kv_tile_idx =
           ceil_div((CAUSAL ? min(kv_end, kv_len - q_len +
                                              (packed_qo_start + cluster_tile_q) / gqa_group_size)
@@ -188,27 +189,10 @@ struct BlockBatchPagedAttentionPersistent {
                                kv_head_idx, k_stride_page, k_stride_h, k_stride_n, block_size,
                                kv_indices, thr_local_kv_offset);
 
-      // uint32_t start_time, end_time;
-      // cp_async::commit_group();
-      // cp_async::wait_group<0>();
-      // start_time = clock();
-      // __threadfence_block();
-      // __syncthreads();
-
       page_load_kv<false, KTraits>(smem_storage, &k_smem_offset_w, k,
                                    kv_start + kv_tile_idx * CTA_TILE_KV, thr_local_kv_offset,
                                    kv_end);
       cp_async::commit_group();
-
-
-      // cp_async::commit_group();
-      // cp_async::wait_group<0>();
-      // __syncthreads();
-      // __threadfence_block();
-      // end_time = clock();
-      // if(blockIdx.y == 0 && threadIdx.x == 0 && CTA_TILE_Q == 128) {
-      //   printf("q_indptr: %d, kv_head_idx: %d, mixed load time: %d\n", q_indptr, kv_head_idx, end_time - start_time);
-      // }
 
       page_load_kv<true, KTraits>(smem_storage, &v_smem_offset_w, v,
                                   kv_start + kv_tile_idx * CTA_TILE_KV, thr_local_kv_offset,
@@ -357,7 +341,8 @@ __global__ __launch_bounds__(PipeKTraits::NUM_THREADS) void PipeBatchPagedAttent
   // smem_t<prefill_worker.SWIZZLE_MODE_Q> pipe_o_p_smem(smem_storage.smem_o_p);
   // smem_t<prefill_worker.SWIZZLE_MODE_Q> pipe_o_d_smem(smem_storage.smem_o_d);
 
-  // while (work_idx_p < work_indptr_p[blockIdx.y + 1] && work_idx_d < work_indptr_d[blockIdx.y + 1]) {
+  // while (work_idx_p < work_indptr_p[blockIdx.y + 1] && work_idx_d < work_indptr_d[blockIdx.y +
+  // 1]) {
   //   prefill_worker.set_work_tile_info(params_prefill, work_idx_p);
   //   decode_worker.set_work_tile_info(params_decode, work_idx_d);
 
@@ -372,13 +357,15 @@ __global__ __launch_bounds__(PipeKTraits::NUM_THREADS) void PipeBatchPagedAttent
   //   decode_worker.page_load_k(&stage2_smem, 0);
   //   cp_async::commit_group();
 
-  //   while(prefill_worker.kv_tile_idx + 1 > prefill_worker.NUM_STAGES && decode_worker.kv_tile_idx + 1 > decode_worker.NUM_STAGES) {
+  //   while(prefill_worker.kv_tile_idx + 1 > prefill_worker.NUM_STAGES && decode_worker.kv_tile_idx
+  //   + 1 > decode_worker.NUM_STAGES) {
   //     cp_async::wait_group<1>();
   //     // __syncthreads();
   //     prefill_worker.gemm_qk(&pipe_q_p_smem, &stage1_smem);
   //     prefill_worker.page_load_v(&stage1_smem, 0);
   //     cp_async::commit_group();
-  //     if(prefill_worker.kv_tile_idx >= prefill_worker.mask_tile_idx && prefill_worker.kv_tile_idx > 0) {
+  //     if(prefill_worker.kv_tile_idx >= prefill_worker.mask_tile_idx && prefill_worker.kv_tile_idx
+  //     > 0) {
   //       prefill_worker.logits_mask(params_prefill);
   //     }
   //     prefill_worker.update_mdo_states();
@@ -388,7 +375,8 @@ __global__ __launch_bounds__(PipeKTraits::NUM_THREADS) void PipeBatchPagedAttent
   //     decode_worker.page_load_v(&stage2_smem, 0);
   //     cp_async::commit_group();
   //     // No mask for decode tiles?
-  //     if(decode_worker.kv_tile_idx >= decode_worker.mask_tile_idx && decode_worker.kv_tile_idx > 0) {
+  //     if(decode_worker.kv_tile_idx >= decode_worker.mask_tile_idx && decode_worker.kv_tile_idx >
+  //     0) {
   //       decode_worker.logits_mask(params_decode);
   //     }
   //     decode_worker.update_mdo_states();
@@ -415,7 +403,8 @@ __global__ __launch_bounds__(PipeKTraits::NUM_THREADS) void PipeBatchPagedAttent
   //   prefill_worker.gemm_qk(&pipe_q_p_smem, &stage1_smem);
   //   prefill_worker.page_load_v(&stage1_smem, 0);
   //   cp_async::commit_group();
-  //   if(prefill_worker.kv_tile_idx >= prefill_worker.mask_tile_idx && prefill_worker.kv_tile_idx > 0) {
+  //   if(prefill_worker.kv_tile_idx >= prefill_worker.mask_tile_idx && prefill_worker.kv_tile_idx >
+  //   0) {
   //     prefill_worker.logits_mask(params_prefill);
   //   }
   //   prefill_worker.update_mdo_states();
@@ -424,7 +413,8 @@ __global__ __launch_bounds__(PipeKTraits::NUM_THREADS) void PipeBatchPagedAttent
   //   decode_worker.gemm_qk(&pipe_q_d_smem, &stage2_smem);
   //   decode_worker.page_load_v(&stage2_smem, 0);
   //   cp_async::commit_group();
-  //   if(decode_worker.kv_tile_idx >= decode_worker.mask_tile_idx && decode_worker.kv_tile_idx > 0) {
+  //   if(decode_worker.kv_tile_idx >= decode_worker.mask_tile_idx && decode_worker.kv_tile_idx > 0)
+  //   {
   //     decode_worker.logits_mask(params_decode);
   //   }
   //   decode_worker.update_mdo_states();
@@ -460,7 +450,8 @@ __global__ __launch_bounds__(PipeKTraits::NUM_THREADS) void PipeBatchPagedAttent
   //   __syncthreads();
 
   //   if(prefill_worker.kv_tile_idx > 0){
-  //     LOOP_SPLIT_MASK(prefill_worker.kv_tile_idx, prefill_worker.kv_tile_idx >= prefill_worker.mask_tile_idx && prefill_worker.kv_tile_idx > 0,
+  //     LOOP_SPLIT_MASK(prefill_worker.kv_tile_idx, prefill_worker.kv_tile_idx >=
+  //     prefill_worker.mask_tile_idx && prefill_worker.kv_tile_idx > 0,
   //       prefill_worker.kv_tile_idx + 1 > prefill_worker.NUM_STAGES, {
   //       prefill_worker.prefetch_offset(1);
   //       cp_async::wait_group<1>();
@@ -492,12 +483,14 @@ __global__ __launch_bounds__(PipeKTraits::NUM_THREADS) void PipeBatchPagedAttent
   //     }
 
   //     __syncthreads();
-  //     prefill_worker.epilogue(smem_storage.cta_sync_o_smem, smem_storage.cta_sync_md_smem, &pipe_o_p_smem);
+  //     prefill_worker.epilogue(smem_storage.cta_sync_o_smem, smem_storage.cta_sync_md_smem,
+  //     &pipe_o_p_smem);
 
   //   }
 
   //   if(decode_worker.kv_tile_idx > 0){
-  //     LOOP_SPLIT_MASK(decode_worker.kv_tile_idx, decode_worker.kv_tile_idx >= decode_worker.mask_tile_idx && decode_worker.kv_tile_idx > 0,
+  //     LOOP_SPLIT_MASK(decode_worker.kv_tile_idx, decode_worker.kv_tile_idx >=
+  //     decode_worker.mask_tile_idx && decode_worker.kv_tile_idx > 0,
   //       decode_worker.kv_tile_idx + 1 > decode_worker.NUM_STAGES, {
   //       decode_worker.prefetch_offset(1);
   //       cp_async::wait_group<1>();
@@ -529,7 +522,8 @@ __global__ __launch_bounds__(PipeKTraits::NUM_THREADS) void PipeBatchPagedAttent
   //     }
 
   //     __syncthreads();
-  //     decode_worker.epilogue(smem_storage.cta_sync_o_smem, smem_storage.cta_sync_md_smem, &pipe_o_d_smem);
+  //     decode_worker.epilogue(smem_storage.cta_sync_o_smem, smem_storage.cta_sync_md_smem,
+  //     &pipe_o_d_smem);
   //   }
 
   //   work_idx_p++;
@@ -542,8 +536,7 @@ __global__ __launch_bounds__(PipeKTraits::NUM_THREADS) void PipeBatchPagedAttent
   smem_t<prefill_worker.SWIZZLE_MODE_KV> v_p_smem(smem_storage.pipe_kv_smem2);
   smem_t<prefill_worker.SWIZZLE_MODE_Q> o_p_smem(smem_storage.smem_o_p);
 
-  while (work_idx_p < work_indptr_p[blockIdx.y+1]) {
-
+  while (work_idx_p < work_indptr_p[blockIdx.y + 1]) {
     prefill_worker.set_work_tile_info(params_prefill, work_idx_p);
     prefill_worker.load_q_global_smem(&q_p_smem);
 
@@ -552,116 +545,106 @@ __global__ __launch_bounds__(PipeKTraits::NUM_THREADS) void PipeBatchPagedAttent
 
     prefill_worker.prefetch_offset(0);
 
-    // uint32_t start_time, end_time;
-    // cp_async::commit_group();
-    // cp_async::wait_group<0>();
-    // start_time = clock();
-    // __threadfence_block();
-    // __syncthreads();
-
     prefill_worker.page_load_k(&k_p_smem, 0);
     cp_async::commit_group();
-
-    // cp_async::commit_group();
-    // cp_async::wait_group<0>();
-    // __syncthreads();
-    // __threadfence_block();
-    // end_time = clock();
-    // if(blockIdx.y == 0 && threadIdx.x == 0) {
-    //   printf("q_indptr: %d, kv_head_idx: %d, pipe load time: %d\n", prefill_worker.q_indptr, prefill_worker.kv_head_idx, end_time - start_time);
-    // }
 
     prefill_worker.page_load_v(&v_p_smem, 0);
     cp_async::commit_group();
 
+    LOOP_SPLIT_MASK(prefill_worker.kv_tile_idx,
+                    prefill_worker.kv_tile_idx >= prefill_worker.mask_tile_idx &&
+                        prefill_worker.kv_tile_idx > 0,
+                    prefill_worker.kv_tile_idx + 1 > prefill_worker.NUM_STAGES, {
+                      prefill_worker.prefetch_offset(1);
+                      cp_async::wait_group<1>();
+                      __syncthreads();
+                      prefill_worker.gemm_qk(&q_p_smem, &k_p_smem);
+                      prefill_worker.logits_mask(params_prefill);
+                      prefill_worker.update_mdo_states();
+                      __syncthreads();
 
-    // LOOP_SPLIT_MASK(prefill_worker.kv_tile_idx, prefill_worker.kv_tile_idx >= prefill_worker.mask_tile_idx && prefill_worker.kv_tile_idx > 0,
-    //   prefill_worker.kv_tile_idx + 1 > prefill_worker.NUM_STAGES, {
-    //   prefill_worker.prefetch_offset(1);
-    //   cp_async::wait_group<1>();
-    //   __syncthreads();
-    //   prefill_worker.gemm_qk(&q_p_smem, &k_p_smem);
-    //   prefill_worker.logits_mask(params_prefill);
-    //   prefill_worker.update_mdo_states();
-    //   __syncthreads();
-    //   prefill_worker.page_load_k(&k_p_smem, 1);
-    //   cp_async::commit_group();
-    //   cp_async::wait_group<1>();
+                      prefill_worker.page_load_k(&k_p_smem, 1);
+                      cp_async::commit_group();
+                      cp_async::wait_group<1>();
 
-    //   __syncthreads();
-    //   prefill_worker.gemm_pv(&v_p_smem);
-    //   __syncthreads();
+                      __syncthreads();
+                      prefill_worker.gemm_pv(&v_p_smem);
+                      __syncthreads();
 
-    //   prefill_worker.page_load_v(&v_p_smem, 1);
-    //   cp_async::commit_group();
-    // });
+                      prefill_worker.page_load_v(&v_p_smem, 1);
+                      cp_async::commit_group();
+                    });
 
-    // cp_async::wait_group<0>();
-    // __syncthreads();
+    cp_async::wait_group<0>();
+    __syncthreads();
 
-    // for (; prefill_worker.kv_tile_idx >= 0; --prefill_worker.kv_tile_idx) {
-    //   prefill_worker.gemm_qk(&q_p_smem, &k_p_smem);
-    //   prefill_worker.logits_mask(params_prefill);
-    //   prefill_worker.update_mdo_states();
-    //   prefill_worker.gemm_pv(&v_p_smem);
-    // }
+    for (; prefill_worker.kv_tile_idx >= 0; --prefill_worker.kv_tile_idx) {
+      prefill_worker.gemm_qk(&q_p_smem, &k_p_smem);
+      prefill_worker.logits_mask(params_prefill);
+      prefill_worker.update_mdo_states();
+      prefill_worker.gemm_pv(&v_p_smem);
+    }
 
-    // __syncthreads();
-    // prefill_worker.epilogue(smem_storage.cta_sync_o_smem, smem_storage.cta_sync_md_smem, &o_p_smem);
+    __syncthreads();
+    prefill_worker.epilogue(smem_storage.cta_sync_o_smem, smem_storage.cta_sync_md_smem,
+    &o_p_smem);
     work_idx_p++;
   }
 
-  // __syncthreads();
+  __syncthreads();
 
-  // // Clean up the remaining Decode work tile
-  // smem_t<decode_worker.SWIZZLE_MODE_Q> q_d_smem(smem_storage.pipe_q_d_smem);
-  // smem_t<decode_worker.SWIZZLE_MODE_KV> k_d_smem(smem_storage.pipe_q_p_smem);
-  // smem_t<decode_worker.SWIZZLE_MODE_KV> v_d_smem(smem_storage.pipe_kv_smem2);
-  // smem_t<decode_worker.SWIZZLE_MODE_Q> o_d_smem(smem_storage.smem_o_d);
+  // Clean up the remaining Decode work tile
+  smem_t<decode_worker.SWIZZLE_MODE_Q> q_d_smem(smem_storage.pipe_q_d_smem);
+  smem_t<decode_worker.SWIZZLE_MODE_KV> k_d_smem(smem_storage.pipe_q_p_smem);
+  smem_t<decode_worker.SWIZZLE_MODE_KV> v_d_smem(smem_storage.pipe_kv_smem2);
+  smem_t<decode_worker.SWIZZLE_MODE_Q> o_d_smem(smem_storage.smem_o_d);
   while (work_idx_d < work_indptr_d[blockIdx.y + 1]) {
-    decode_worker.set_work_tile_info(params_decode, work_idx_d);
-  //   decode_worker.load_q_global_smem(&q_d_smem);
-  //   decode_worker.init_kv_info();
-  //   __syncthreads();
-  //   decode_worker.prefetch_offset(0);
-  //   decode_worker.page_load_k(&k_d_smem, 0);
-  //   cp_async::commit_group();
-  //   decode_worker.page_load_v(&v_d_smem, 0);
-  //   cp_async::commit_group();
+      decode_worker.set_work_tile_info(params_decode, work_idx_d);
+      decode_worker.load_q_global_smem(&q_d_smem);
+      decode_worker.init_kv_info();
+      __syncthreads();
+      decode_worker.prefetch_offset(0);
 
-  //   LOOP_SPLIT_MASK(decode_worker.kv_tile_idx, decode_worker.kv_tile_idx >= decode_worker.mask_tile_idx && decode_worker.kv_tile_idx > 0,
-  //     decode_worker.kv_tile_idx + 1 > decode_worker.NUM_STAGES, {
-  //     decode_worker.prefetch_offset(1);
-  //     cp_async::wait_group<1>();
-  //     __syncthreads();
-  //     decode_worker.gemm_qk(&q_d_smem, &k_d_smem);
-  //     decode_worker.logits_mask(params_decode);
-  //     decode_worker.update_mdo_states();
-  //     __syncthreads();
-  //     decode_worker.page_load_k(&k_d_smem, 1);
-  //     cp_async::commit_group();
-  //     cp_async::wait_group<1>();
+      decode_worker.page_load_k(&k_d_smem, 0);
+      cp_async::commit_group();
+      decode_worker.page_load_v(&v_d_smem, 0);
+      cp_async::commit_group();
 
-  //     __syncthreads();
-  //     decode_worker.gemm_pv(&v_d_smem);
-  //     __syncthreads();
+      LOOP_SPLIT_MASK(decode_worker.kv_tile_idx, decode_worker.kv_tile_idx >=
+      decode_worker.mask_tile_idx && decode_worker.kv_tile_idx > 0,
+        decode_worker.kv_tile_idx + 1 > decode_worker.NUM_STAGES, {
+        decode_worker.prefetch_offset(1);
+        cp_async::wait_group<1>();
+        __syncthreads();
+        decode_worker.gemm_qk(&q_d_smem, &k_d_smem);
+        decode_worker.logits_mask(params_decode);
+        decode_worker.update_mdo_states();
+        __syncthreads();
+        decode_worker.page_load_k(&k_d_smem, 1);
+        cp_async::commit_group();
+        cp_async::wait_group<1>();
 
-  //     decode_worker.page_load_v(&v_d_smem, 1);
-  //     cp_async::commit_group();
-  //   });
+        __syncthreads();
+        decode_worker.gemm_pv(&v_d_smem);
+        __syncthreads();
 
-  //   cp_async::wait_group<0>();
-  //   __syncthreads();
+        decode_worker.page_load_v(&v_d_smem, 1);
+        cp_async::commit_group();
+      });
 
-  //   for (; decode_worker.kv_tile_idx >= 0; --decode_worker.kv_tile_idx) {
-  //     decode_worker.gemm_qk(&q_d_smem, &k_d_smem);
-  //     decode_worker.logits_mask(params_decode);
-  //     decode_worker.update_mdo_states();
-  //     decode_worker.gemm_pv(&v_d_smem);
-  //   }
+      cp_async::wait_group<0>();
+      __syncthreads();
 
-  //   __syncthreads();
-  //   decode_worker.epilogue(smem_storage.cta_sync_o_smem, smem_storage.cta_sync_md_smem, &o_d_smem);
+      for (; decode_worker.kv_tile_idx >= 0; --decode_worker.kv_tile_idx) {
+        decode_worker.gemm_qk(&q_d_smem, &k_d_smem);
+        decode_worker.logits_mask(params_decode);
+        decode_worker.update_mdo_states();
+        decode_worker.gemm_pv(&v_d_smem);
+      }
+
+      __syncthreads();
+      decode_worker.epilogue(smem_storage.cta_sync_o_smem, smem_storage.cta_sync_md_smem,
+      &o_d_smem);
     work_idx_d++;
   }
 }

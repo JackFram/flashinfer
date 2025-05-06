@@ -158,20 +158,20 @@ struct PersistentWorker {
   }
 
   __device__ __forceinline__ void init_kv_info() {
-    int kv_tile_idx =
+    kv_tile_idx =
         ceil_div((CAUSAL ? min(kv_end,
                                kv_len - q_len + (packed_qo_start + cluster_tile_q) / gqa_group_size)
                          : kv_end),
                  CTA_TILE_KV) -
         1 - (kv_start / CTA_TILE_KV);
 
-    int mask_tile_idx =
+    mask_tile_idx =
         (CAUSAL ? min(kv_end, kv_len - q_len + packed_qo_start / gqa_group_size) : kv_end) /
             CTA_TILE_KV -
         (kv_start / CTA_TILE_KV);
 
-    uint32_t block_iter_base = kv_indptr * block_size + kv_start;
-    uint32_t packed_kv_bound = kv_indptr * block_size + kv_len;
+    block_iter_base = kv_indptr * block_size + kv_start;
+    packed_kv_bound = kv_indptr * block_size + kv_len;
   }
 
   __device__ __forceinline__ void prefetch_offset(const uint32_t prefetch_offset) {
@@ -194,30 +194,29 @@ struct PersistentWorker {
 
   __device__ __forceinline__ void page_load_k(smem_t<SWIZZLE_MODE_KV>* k_smem,
                                               const uint32_t kv_tile_offset) {
-    using DType = typename KTraits::DTypeKV;
     constexpr SharedMemFillMode fill_mode = SharedMemFillMode::kNoFill;
-    constexpr uint32_t NUM_MMA_D = KTraits::NUM_MMA_D_QK;
+    constexpr uint32_t NUM_MMA_D = NUM_MMA_D_QK;
     constexpr uint32_t NUM_WARPS = KTraits::NUM_WARPS;
-    constexpr uint32_t UPCAST_STRIDE = KTraits::UPCAST_STRIDE_K;
+    constexpr uint32_t UPCAST_STRIDE = UPCAST_STRIDE_K;
     const uint32_t kv_idx_base = kv_start + (kv_tile_idx - kv_tile_offset) * CTA_TILE_KV;
     if constexpr (SWIZZLE_MODE_KV == SwizzleMode::k128B) {
       uint32_t kv_idx = kv_idx_base + warp_idx * 4 + lane_idx / 8;
       // NOTE: NUM_MMA_KV * 4 / NUM_WARPS_Q = NUM_WARPS_KV * NUM_MMA_KV * 4 / num_warps
       static_assert(NUM_MMA_KV * 4 % NUM_WARPS_Q == 0);
-
+      
 #pragma unroll
       for (uint32_t i = 0; i < NUM_MMA_KV * 4 / NUM_WARPS_Q; ++i) {
-        DType* kv = k + thr_local_kv_offset[i];
+        DTypeKV* kv = k + thr_local_kv_offset[i];
 #pragma unroll
-        for (uint32_t j = 0; j < NUM_MMA_D / (8 / sizeof(DType)); ++j) {
+        for (uint32_t j = 0; j < NUM_MMA_D / (8 / sizeof(DTypeKV)); ++j) {
           k_smem->load_128b_async<fill_mode>(k_smem_offset_w, kv, kv_idx < kv_end);
           k_smem_offset_w = k_smem->template advance_offset_by_column<8>(k_smem_offset_w, j);
-          kv += 8 * upcast_size<DType>();
+          kv += 8 * upcast_size<DTypeKV>();
         }
         kv_idx += NUM_WARPS * 4;
         k_smem_offset_w =
             k_smem->template advance_offset_by_row<NUM_WARPS * 4, UPCAST_STRIDE>(k_smem_offset_w) -
-            sizeof(DType) * NUM_MMA_D;
+            sizeof(DTypeKV) * NUM_MMA_D;
       }
       k_smem_offset_w -= CTA_TILE_KV * UPCAST_STRIDE;
     } else {
@@ -226,7 +225,7 @@ struct PersistentWorker {
       static_assert(NUM_MMA_KV * 2 % NUM_WARPS_Q == 0);
 #pragma unroll
       for (uint32_t i = 0; i < NUM_MMA_KV * 2 / NUM_WARPS_Q; ++i) {
-        DType* kv = k + thr_local_kv_offset[i];
+        DTypeKV* kv = k + thr_local_kv_offset[i];
         k_smem->load_128b_async<fill_mode>(k_smem_offset_w, kv, kv_idx < kv_end);
         kv_idx += NUM_WARPS * 8;
         k_smem_offset_w =
