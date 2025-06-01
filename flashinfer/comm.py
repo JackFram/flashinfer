@@ -370,6 +370,57 @@ def create_shared_buffer(
     return pointers
 
 
+def create_shared_all_to_all_buffer(
+    size_in_bytes: int, group: Optional[ProcessGroup] = None
+) -> Tuple[List[int], List[int]]:
+    
+    local_tensor_list = []
+    local_ptr_list: List[int] = []
+    remote_ptr_list: List[int] = []
+
+    if group is None:
+        group = dist.group.WORLD
+        world_size = dist.get_world_size(group=group)
+        rank = dist.get_rank(group=group)
+    
+    # Allocate local buffer and get IPC handle
+    for i in range(dist.get_world_size(group=group)):
+        pointer = cudart.cudaMalloc(size_in_bytes)
+        handle = cudart.cudaIpcGetMemHandle(pointer)
+
+        handle_bytes = ctypes.string_at(ctypes.addressof(handle), ctypes.sizeof(handle))
+        input_tensor = torch.tensor(bytearray(handle_bytes), dtype=torch.uint8).to(
+            f"cuda:{rank}"
+        )
+        local_tensor_list.append(input_tensor)
+        local_ptr_list.append(pointer.value)
+
+    gathered_tensors = [torch.empty_like(local_tensor_list[0]) for _ in range(world_size)]
+    dist.all_to_all(gathered_tensors, local_tensor_list, group=group)
+
+    handles = []
+    handle_type = type(handle)
+    for tensor in gathered_tensors:
+        bytes_data = tensor.cpu().numpy().tobytes()
+        handle_obj = handle_type()
+        ctypes.memmove(ctypes.addressof(handle_obj), bytes_data, len(bytes_data))
+        handles.append(handle_obj)
+
+    for i, h in enumerate(handles):
+        if i == rank:
+            remote_ptr_list.append(local_ptr_list[i])
+        else:
+            try:
+                opened_ptr = cudart.cudaIpcOpenMemHandle(h)
+                remote_ptr_list.append(opened_ptr.value)
+            except Exception as e:
+                print(f"Rank {rank}: Failed to open IPC handle from rank {i}: {e}")
+                raise
+
+    dist.barrier(group=group)
+    return local_ptr_list, remote_ptr_list
+
+
 def free_shared_buffer(
     pointers: List[int], group: Optional[ProcessGroup] = None
 ) -> None:

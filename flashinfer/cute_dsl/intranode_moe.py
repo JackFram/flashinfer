@@ -1,0 +1,190 @@
+import os
+import time
+import torch
+import torch.distributed as dist
+
+import cutlass
+import cutlass.cute as cute
+import cutlass.utils as utils
+from cutlass.cute.nvgpu import cpasync, tcgen05
+import cutlass.utils.blackwell_helpers as sm100_utils
+import cutlass.torch as cutlass_torch
+from cutlass.cute.runtime import from_dlpack
+from cutlass.torch import dtype as torch_dtype
+
+import cuda.bindings.runtime as cudart
+import flashinfer.comm as comm
+
+from cuda_utils import checkCudaErrors
+from moe_utils import MoEParam
+from dist_utils import ProcessGroupInfo, parallel_launch
+from kernel.sm100_intra_dispatch import IntraDispatchKernel
+from kernel.sm100_grouped_gemm import run_grouped_gemm
+
+def test_loop(dist_param: ProcessGroupInfo):
+
+    '''
+    Initialize per rank input tensors
+    '''
+
+    num_ranks = dist_param.world_size
+    num_local_ranks = dist_param.world_local_size
+    rank = dist_param.rank
+    local_rank = dist_param.local_rank 
+    node_rank = dist_param.node_rank
+    device = dist_param.device
+
+    num_tokens, hidden_dim, num_topk, num_experts = 128, 7168, 8, (32 // num_ranks) * num_ranks
+
+    assert num_experts % num_ranks == 0, f"num_experts {num_experts} should be divisible by num_ranks {num_ranks}"
+    num_local_experts = num_experts // num_ranks
+
+    moe_param = MoEParam(
+            num_experts=num_experts,
+            num_topk=num_topk,
+            hidden_dim=hidden_dim,
+            num_tokens_per_rank=num_tokens // num_ranks,
+            in_dtype=cutlass.Float16, # BFloat16 has a bug in cute dsl when constructing the buffer
+            out_dtype=cutlass.Float16,
+        )
+
+    # Initialize input tensors
+    input_tensor = torch.randn((num_tokens // num_ranks, hidden_dim), dtype=torch_dtype(moe_param.in_dtype), device='cuda')
+    gate_scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device='cuda').abs() + 1
+    topk_indices = torch.topk(gate_scores, num_topk, dim=-1, largest=True, sorted=False)[1].to(torch.int32)
+    #TODO(Zhihao): derive the weights from the scores
+    topk_weights = torch.randn((num_tokens, num_topk), dtype=torch.float32, device='cuda')
+    local_token_send_count_per_expert = torch.zeros((num_experts, 1), dtype=torch.int32, device='cuda')
+    rank_token_count = torch.zeros((1), dtype=torch.int32, device='cuda')
+    rank_token_index = torch.zeros((num_tokens * num_topk), dtype=torch.int32, device='cuda')
+    
+    '''
+    dispatch
+    '''
+    num_tokens_per_local_expert_recv = torch.empty(
+        num_local_experts,
+        dtype=torch.int32,
+    ).fill_(0).cuda()
+
+    recv_token_tensor = torch.empty(
+        (num_ranks, num_local_experts, num_tokens, 1, hidden_dim),
+        dtype=torch_dtype(moe_param.in_dtype),
+        device='cuda',
+    ).fill_(0).cuda()
+
+    input_tensor_cute = from_dlpack(input_tensor, assumed_align=16)
+    topk_indices_cute = from_dlpack(topk_indices, assumed_align=16)
+    num_tokens_per_local_expert_recv_cute = from_dlpack(num_tokens_per_local_expert_recv, assumed_align=16)
+    recv_token_tensor_cute = from_dlpack(recv_token_tensor, assumed_align=16)
+    local_token_send_count_per_expert_cute = from_dlpack(local_token_send_count_per_expert, assumed_align=16)
+    rank_token_count_cute = from_dlpack(rank_token_count, assumed_align=16)
+    rank_token_index_cute = from_dlpack(rank_token_index, assumed_align=16)
+
+    intra_dispatch_kernel = IntraDispatchKernel(
+        moe_param=moe_param,
+        dist_param=dist_param,
+    )
+
+    buffer_size_in_bytes = intra_dispatch_kernel.buffer_size_in_bytes
+
+    # Construct buffer for dispatching and combining tokens
+    local_buffer_ptr_list, remote_buffer_ptr_list = comm.create_shared_all_to_all_buffer(
+        size_in_bytes=buffer_size_in_bytes,
+    )
+
+    # Construct buffer for recording token counts:
+    count_buffer_ptr_list = comm.create_shared_buffer(
+        size_in_bytes=4 * moe_param.num_tokens_per_rank,
+    )
+
+    def convert_list_to_tensor(l, dtype) -> tuple[torch.Tensor, cute.Tensor]:
+        torch_tensor = torch.tensor(l, dtype=dtype).cuda()
+        cute_tensor = from_dlpack(torch_tensor, assumed_align=16)
+        return torch_tensor, cute_tensor
+    
+    local_buffer_ptr_tensor, local_buffer_ptr_cute = convert_list_to_tensor(local_buffer_ptr_list, torch.int64)
+    remote_buffer_ptr_tensor, remote_buffer_ptr_cute = convert_list_to_tensor(remote_buffer_ptr_list, torch.int64)
+    count_buffer_ptr_tensor, count_buffer_ptr_cute = convert_list_to_tensor(count_buffer_ptr_list, torch.int64)
+    
+    intra_dispatch_kernel_compiled = cute.compile(
+        intra_dispatch_kernel,
+        input_tensor_cute,
+        topk_indices_cute,
+        num_tokens_per_local_expert_recv_cute,
+        local_token_send_count_per_expert_cute,
+        rank_token_count_cute,
+        rank_token_index_cute,
+        recv_token_tensor_cute,
+        local_buffer_ptr_cute,
+        remote_buffer_ptr_cute,
+        count_buffer_ptr_cute,
+    )
+
+    intra_dispatch_kernel_compiled(
+        input_tensor_cute,
+        topk_indices_cute,
+        num_tokens_per_local_expert_recv_cute,
+        local_token_send_count_per_expert_cute,
+        rank_token_count_cute,
+        rank_token_index_cute,
+        recv_token_tensor_cute,
+        local_buffer_ptr_cute,
+        remote_buffer_ptr_cute,
+        count_buffer_ptr_cute,
+    )
+
+    '''
+    Grouped GEMM
+    '''
+
+    return
+
+    run_grouped_gemm(
+        num_groups=2,
+        problem_sizes_mnkl=((128, 128, 128, 1), (128, 128, 128, 1)),
+        ab_dtype=cutlass.Float16,
+        c_dtype=cutlass.Float16,
+        acc_dtype=cutlass.Float32,
+        a_major="k",
+        b_major="k",
+        c_major="n",
+        mma_tiler_mn=(128, 128),
+        cluster_shape_mn=(1, 1),
+        use_2cta_instrs=False,
+        tensormap_update_mode=utils.TensorMapUpdateMode.SMEM,
+        tolerance=1e-01,
+        warmup_iterations=0,
+        iterations=1,
+        skip_ref_check=False,
+    )
+
+    '''
+    Combine
+    '''
+
+    '''
+    Check results
+    '''
+
+    print(f"rank{rank}: PASS")
+
+
+    dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    num_processes = 2
+    parallel_launch(
+        num_processes,
+        test_loop,
+    )
+
+    '''
+    MoE:
+    Input (per rank):
+    input_token_tensor: [num_tokens, hidden_dim]
+    topk_scores: [num_token, num_experts] -> topk_weights: [num_token, num_activate_experts], topk_indices: [num_token, num_activate_experts]
+    
+    Output (per rank):
+    output_token_tensor: [num_token, hidden_dim]
+    '''

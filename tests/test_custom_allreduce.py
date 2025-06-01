@@ -139,3 +139,6 @@ def test_vllm_custom_allreduce(world_size):
         target_args=(),
     )
     print(f"custom allreduce tp = {world_size}: OK")
+
+if __name__ == "__main__":
+    test_vllm_custom_allreduce(4)
