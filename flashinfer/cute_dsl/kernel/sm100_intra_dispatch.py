@@ -172,10 +172,7 @@ class IntraDispatchKernel:
 
         if (block_idx * block_dim + thread_idx < self.num_local_ranks):
             sync_tensor = self.get_dispatch_sync_buffer(remote_buffer_ptr, block_idx * block_dim + thread_idx)
-            sync_tensor[0] = cutlass.Uint32(1) # TODO(Zhihao): need to store in volatile mode
-
-        # warp_idx: cutlass.Constexpr[int] = thread_idx // 32
-        # lane_idx: cutlass.Constexpr[int] = thread_idx % 32
+            inline_ptx.st_flag_volatile(sync_tensor, cutlass.Uint32(1))  # set the flag to 1 to indicate the dispatch starts
 
         if (block_idx < self.num_tokens_per_rank):
 
@@ -225,7 +222,7 @@ class IntraDispatchKernel:
 
         # grid_sync
 
-
+        
 
         # send token count to remote buffer
 
