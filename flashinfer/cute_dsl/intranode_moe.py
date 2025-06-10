@@ -57,6 +57,10 @@ def test_loop(dist_param: ProcessGroupInfo):
     local_token_send_count_per_expert = torch.zeros((num_experts, 1), dtype=torch.int32, device='cuda')
     rank_token_count = torch.zeros((1), dtype=torch.int32, device='cuda')
     rank_token_index = torch.zeros((num_tokens * num_topk), dtype=torch.int32, device='cuda')
+
+    global_sync_semaphore = torch.zeros((2, 1), dtype=torch.int32, device='cuda')
+    global_sync_semaphore_cute = from_dlpack(global_sync_semaphore, assumed_align=16)
+
     
     '''
     dispatch
@@ -118,6 +122,7 @@ def test_loop(dist_param: ProcessGroupInfo):
         local_buffer_ptr_cute,
         remote_buffer_ptr_cute,
         count_buffer_ptr_cute,
+        global_sync_semaphore_cute,
     )
 
     intra_dispatch_kernel_compiled(
@@ -131,6 +136,7 @@ def test_loop(dist_param: ProcessGroupInfo):
         local_buffer_ptr_cute,
         remote_buffer_ptr_cute,
         count_buffer_ptr_cute,
+        global_sync_semaphore_cute,
     )
 
     '''

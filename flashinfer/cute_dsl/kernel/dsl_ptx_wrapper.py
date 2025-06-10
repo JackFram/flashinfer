@@ -5,6 +5,7 @@ import cutlass.cute as cute
 from cutlass.cute.typing import Int, Boolean, Int32, Float32, Numeric, as_numeric, Uint32
 from typing import Optional, Tuple, Union, Callable
 
+
 @dsl_user_op
 def atomic_add(input: cute.Tensor, value: cutlass.Int32, *, loc=None, ip=None) -> cutlass.Int32:
     """
@@ -14,6 +15,7 @@ def atomic_add(input: cute.Tensor, value: cutlass.Int32, *, loc=None, ip=None) -
     llvm_ptr = input.iterator.llvm_ptr
     res = nvvm.atomicrmw(res=T.i32(), op=nvvm.AtomicOpKind.ADD, ptr=llvm_ptr, a=cutlass.Int32(value).ir_value())
     return res
+
 
 @dsl_user_op
 def st_flag_volatile(sync_tensor: cute.Tensor, flag: Uint32, *, loc=None, ip=None) -> None:
@@ -27,6 +29,7 @@ def st_flag_volatile(sync_tensor: cute.Tensor, flag: Uint32, *, loc=None, ip=Non
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
     )
+
 
 @dsl_user_op
 def ld_flag_volatile(sync_tensor: cute.Tensor, *, loc=None, ip=None) -> Uint32:
@@ -43,6 +46,7 @@ def ld_flag_volatile(sync_tensor: cute.Tensor, *, loc=None, ip=None) -> Uint32:
         )
     )
 
+
 @dsl_user_op
 def ld_flag_acquire(sync_tensor: cute.Tensor, *, loc=None, ip=None) -> Uint32:
     flag_addr_ptr_i64 = sync_tensor.iterator.toint(loc=loc, ip=ip).ir_value()
@@ -58,8 +62,9 @@ def ld_flag_acquire(sync_tensor: cute.Tensor, *, loc=None, ip=None) -> Uint32:
         )
     )
 
+
 @dsl_user_op
-def st_flag_volatile(sync_tensor: cute.Tensor, flag: Uint32, *, loc=None, ip=None) -> None:
+def st_flag_release(sync_tensor: cute.Tensor, flag: Uint32, *, loc=None, ip=None) -> None:
     flag_addr_ptr_i64 = sync_tensor.iterator.toint(loc=loc, ip=ip).ir_value()
     llvm.inline_asm(
         None,

@@ -24,6 +24,7 @@ A intra-node dispatch kernel for the MoE model with cute DSL on blackwell (SM100
 TODO(Zhihao): 
   1. Have a dist_buffer class
   2. Support generalized number of tokens and experts
+  3. Implement Grid Sync
 """
 
 class IntraDispatchKernel:
@@ -98,6 +99,8 @@ class IntraDispatchKernel:
         local_buffer_ptr: cute.Tensor,
         remote_buffer_ptr: cute.Tensor,
         count_buffer_ptr: cute.Tensor,
+        # sync semaphore
+        global_sync_semaphore: cute.Tensor,
     ):
 
         # Define shared storage for kernel
@@ -133,6 +136,7 @@ class IntraDispatchKernel:
             local_buffer_ptr=local_buffer_ptr,
             remote_buffer_ptr=remote_buffer_ptr,
             count_buffer_ptr=count_buffer_ptr,
+            global_sync_semaphore=global_sync_semaphore,
         ).launch(
             grid=grid_dim,
             block=block_dim,
@@ -156,6 +160,8 @@ class IntraDispatchKernel:
         local_buffer_ptr: cute.Tensor,
         remote_buffer_ptr: cute.Tensor,
         count_buffer_ptr: cute.Tensor,
+        # sync semaphore
+        global_sync_semaphore: cute.Tensor,
     ):
         thread_idx, _, _ = cute.arch.thread_idx()
         block_idx, _, _ = cute.arch.block_idx()
@@ -167,6 +173,8 @@ class IntraDispatchKernel:
         send_index_buffer = storage.send_index_buffer.get_tensor(
             cute.make_layout((1), stride=(1))
         )
+
+        self.global_sync_semaphore = global_sync_semaphore
 
         # dispatch send
 
@@ -222,7 +230,7 @@ class IntraDispatchKernel:
 
         # grid_sync
 
-        
+        self.grid_sync()
 
         # send token count to remote buffer
 
@@ -231,22 +239,31 @@ class IntraDispatchKernel:
             remote_rank = expert_idx // self.num_local_experts
             remote_expert_idx = expert_idx % self.num_local_experts
             sync_tensor = self.get_count_buffer_ptr(remote_buffer_ptr, remote_rank, remote_expert_idx)
-            sync_tensor[0] = local_token_send_count_per_expert[expert_idx] + 1  # TODO(Zhihao): need to store in release mode
+            inline_ptx.st_flag_release(sync_tensor, local_token_send_count_per_expert[expert_idx, 0] + 1)  # use the token count as the flag to indicate the dispatch send is done
+            # cute.printf(">??-[send-{}] remote_rank: {}, remote_expert_idx: {}, token_count: {}", self.dist_param.local_rank, remote_rank, remote_expert_idx, local_token_send_count_per_expert[expert_idx])
 
         # dispatch recv
 
         # 1. use ld_acquire to wait for the token to be sent and collect meta info
 
-        if (block_idx < self.num_local_experts * self.num_local_ranks):
+        if (block_idx < self.num_local_experts * self.num_local_ranks and thread_idx == 0): # perplexity use thread_parallel not sure if warp or block parallel is better
             local_expert_idx = block_idx % self.num_local_experts
             local_rank = block_idx // self.num_local_experts
+            count_tensor = self.get_count_buffer_ptr(local_buffer_ptr, local_rank, local_expert_idx)
+            token_count = 0
+            while(cutlass.dynamic_expr(token_count == 0)):
+                token_count = inline_ptx.ld_flag_acquire(count_tensor)
+            token_count -= 1
+            # cute.printf(">??-[recv-{}] local_rank: {}, local_expert_idx: {}, token_count: {}", self.dist_param.local_rank, local_rank, local_expert_idx, token_count)
+            # token_count = cutlass.Int32(2) # temporary for testing
+            write_index = inline_ptx.atomic_add(rank_token_count, token_count)
+            for i in cutlass.range_dynamic(0, token_count, 1, unroll=1):
+                rank_token_index[write_index+i] = i + block_idx * self.max_num_tokens
 
-            # token_count = self.get_count_buffer_ptr(local_buffer_ptr, local_rank, local_expert_idx)[0] - 1 # TODO(Zhihao): use ld_acquire here
-            token_count = cutlass.Int32(2) # temporary for testing
-            if thread_idx == 0:
-                write_index = inline_ptx.atomic_add(rank_token_count, token_count)
-                for i in cutlass.range_dynamic(0, token_count, 1, unroll=1):
-                    rank_token_index[write_index+i] = i + block_idx * self.max_num_tokens
+        self.grid_sync()
+
+        if(block_idx == 0 and thread_idx == 0):
+            cute.printf(">??-[recv-{}] rank_token_count: {}", self.dist_param.local_rank, rank_token_count[0])
 
         # 2. cp from local buffer to output tensor (token parallel)
         if (block_idx < rank_token_count[0]):
@@ -268,8 +285,6 @@ class IntraDispatchKernel:
             tiled_dst_tensor = cute.zipped_divide(dst_tensor, self.thr_tile_shape)
             thr_dst_vec = tiled_dst_tensor[(None, (0, thread_idx))]
             thr_dst_vec.store(thr_src_vec.load())
-
-        
 
     @cute.jit
     def make_global_tensor_from_buffer_ptr(
@@ -442,3 +457,54 @@ class IntraDispatchKernel:
                 layout=cute.make_layout((1), stride=(1)),
                 ptr_i64=buffer_ptr_tensor[rank],
             )
+    
+    @cute.jit
+    def grid_sync(self):
+        """
+        Perform a grid sync operation.
+        """
+        
+        thread_idx, _, _ = cute.arch.thread_idx()
+        sync_count, _, _ = cute.arch.grid_dim()
+
+        if(thread_idx == 0):
+            arrive_count = inline_ptx.atomic_add(
+                self.global_sync_semaphore[0, None],
+                cutlass.Int32(1),
+            )
+
+            cute.printf(
+                ">??-[sync-{}] arrive_count: {}, sync_count: {}",
+                self.dist_param.local_rank,
+                arrive_count,
+                sync_count,
+            )
+
+            while(cutlass.dynamic_expr(arrive_count < sync_count)):
+                arrive_count = inline_ptx.ld_flag_acquire(self.global_sync_semaphore[0, None])
+
+            
+            arrive_count = inline_ptx.atomic_add(
+                self.global_sync_semaphore[1, None],
+                cutlass.Int32(1),
+            )
+
+            if(arrive_count == sync_count - 1):
+                inline_ptx.st_flag_release(self.global_sync_semaphore[0, None], cutlass.Int32(0))
+                inline_ptx.st_flag_release(self.global_sync_semaphore[1, None], cutlass.Int32(0))
+
+            arrive_count = inline_ptx.ld_flag_acquire(self.global_sync_semaphore[1, None])
+
+            while(cutlass.dynamic_expr(arrive_count != 0)):
+                arrive_count = inline_ptx.ld_flag_acquire(self.global_sync_semaphore[1, None])
+
+
+        cute.arch.sync_threads()
+
+        
+
+
+        
+
+
+        
