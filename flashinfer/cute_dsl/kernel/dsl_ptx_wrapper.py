@@ -18,6 +18,17 @@ def atomic_add(input: cute.Tensor, value: cutlass.Int32, *, loc=None, ip=None) -
 
 
 @dsl_user_op
+def atomic_add_release(input: cute.Tensor, value: cutlass.Int32, *, loc=None, ip=None) -> cutlass.Int32:
+    """
+    Perform an atomic addition on the input tensor using NVVM.
+    This function assumes that the input tensor is a pointer to an integer type.
+    """
+    llvm_ptr = input.iterator.llvm_ptr
+    res = nvvm.atomicrmw(res=T.i32(), op=nvvm.AtomicOpKind.ADD, ptr=llvm_ptr, a=cutlass.Int32(value).ir_value())
+    return res
+
+
+@dsl_user_op
 def st_flag_volatile(sync_tensor: cute.Tensor, flag: Uint32, *, loc=None, ip=None) -> None:
     flag_addr_ptr_i64 = sync_tensor.iterator.toint(loc=loc, ip=ip).ir_value()
     llvm.inline_asm(

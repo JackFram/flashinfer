@@ -333,6 +333,7 @@ def create_shared_buffer(
     size_in_bytes: int, group: Optional[ProcessGroup] = None
 ) -> List[int]:
     pointer = cudart.cudaMalloc(size_in_bytes)
+    cudart.cudaMemset(pointer, 0, size_in_bytes)
     handle = cudart.cudaIpcGetMemHandle(pointer)
     if group is None:
         group = dist.group.WORLD
@@ -386,6 +387,7 @@ def create_shared_all_to_all_buffer(
     # Allocate local buffer and get IPC handle
     for i in range(dist.get_world_size(group=group)):
         pointer = cudart.cudaMalloc(size_in_bytes)
+        cudart.cudaMemset(pointer, 0, size_in_bytes)
         handle = cudart.cudaIpcGetMemHandle(pointer)
 
         handle_bytes = ctypes.string_at(ctypes.addressof(handle), ctypes.sizeof(handle))
